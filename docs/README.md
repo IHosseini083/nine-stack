@@ -1,6 +1,6 @@
-# HermesStack Documentation
+# NineStack Documentation
 
-This directory contains technical guides and architectural documentation for HermesStack.
+This directory contains technical guides and architectural documentation for NineStack.
 
 ## Documents
 

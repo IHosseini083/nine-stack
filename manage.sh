@@ -279,12 +279,10 @@ tui_header() {
     fi
 
     local b_router="${C_DIM}○ 9Router${C_RESET}"
-    local b_hermes="${C_DIM}○ Hermes${C_RESET}"
     local b_caddy="${C_DIM}○ Caddy${C_RESET}"
     local b_xray="${C_DIM}○ Xray${C_RESET}"
 
     grep -q "^ai-stack-nine-router$" <<<"$running_names" && b_router="${C_GREEN}● 9Router${C_RESET}"
-    grep -q "^ai-stack-hermes$" <<<"$running_names"      && b_hermes="${C_GREEN}● Hermes${C_RESET}"
     grep -q "^ai-stack-caddy$" <<<"$running_names"       && b_caddy="${C_GREEN}● Caddy${C_RESET}"
     grep -q "^ai-stack-xray$" <<<"$running_names"        && b_xray="${C_GREEN}● Xray${C_RESET}"
 
@@ -311,34 +309,30 @@ tui_header() {
         fi
     fi
 
-    local dash_en
-    dash_en=$(env_get "HERMES_DASHBOARD_ENABLED" "true")
-    local api_en
-    api_en=$(env_get "HERMES_API_ENABLED" "true")
     local caddy_en
     caddy_en=$(env_get "CADDY_ENABLED" "auto")
     local r_mem
     r_mem=$(env_get "NINE_ROUTER_MAX_MEM" "256")
+    local req_key
+    req_key=$(env_get "REQUIRE_API_KEY" "false")
 
     local dom_cnt=0
     [[ -f "$STACK_DIR/domains.tsv" ]] && dom_cnt=$(grep -cve '^\s*$' "$STACK_DIR/domains.tsv" 2>/dev/null || echo 0)
 
-    local dash_pill="${C_GREEN}ON${C_RESET}"
-    [[ "$dash_en" != "true" ]] && dash_pill="${C_YELLOW}OFF (Light)${C_RESET}"
-    local api_pill="${C_GREEN}ON${C_RESET}"
-    [[ "$api_en" != "true" ]] && api_pill="${C_YELLOW}OFF${C_RESET}"
+    local key_pill="${C_DIM}Off (sk_9router)${C_RESET}"
+    [[ "$req_key" == "true" ]] && key_pill="${C_GREEN}Enforced${C_RESET}"
 
     printf "\n"
     printf "  %b╭──────────────────────────────────────────────────────────────────────╮%b\n" "$C_CYAN" "$C_RESET"
-    printf "  %b│%b  %b⚡ HERMES STACK MANAGER v%-8s%b   %bRAM:%b %-26s %b│%b\n" \
+    printf "  %b│%b  %b⚡ NINE-STACK MANAGER v%-8s%b  %bRAM:%b %-27s %b│%b\n" \
         "$C_CYAN" "$C_RESET" "$C_BOLD$C_WHITE" "$VERSION" "$C_RESET" "$C_DIM" "$C_RESET" "$mem_str" "$C_CYAN" "$C_RESET"
     printf "  %b├──────────────────────────────────────────────────────────────────────┤%b\n" "$C_CYAN" "$C_RESET"
-    printf "  %b│%b  %bServices:%b  %b   %b   %b   %b\n" \
-        "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$b_router" "$b_hermes" "$b_caddy" "$b_xray"
+    printf "  %b│%b  %bServices:%b  %b      %b      %b\n" \
+        "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$b_router" "$b_caddy" "$b_xray"
     printf "  %b│%b  %bNetwork:%b   Profile: %b%-6s%b │ Proxy: %b │ Domains: %b%d%b\n" \
         "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$profile" "$C_RESET" "$prx_badge" "$C_BOLD" "$dom_cnt" "$C_RESET"
-    printf "  %b│%b  %bFeatures:%b  WebUI: %b │ API: %b │ Caddy: %b%s%b │ Heap: %b%sM%b\n" \
-        "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$dash_pill" "$api_pill" "$C_CYAN" "$caddy_en" "$C_RESET" "$C_CYAN" "$r_mem" "$C_RESET"
+    printf "  %b│%b  %bFeatures:%b  Caddy: %b%s%b │ V8 Heap: %b%sM%b │ API Key: %b\n" \
+        "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$caddy_en" "$C_RESET" "$C_CYAN" "$r_mem" "$C_RESET" "$key_pill"
     printf "  %b╰──────────────────────────────────────────────────────────────────────╯%b\n" "$C_CYAN" "$C_RESET"
 }
 
@@ -378,7 +372,7 @@ trap cleanup EXIT INT TERM
 # Path & Directory Initialization
 # ------------------------------------------------------------------------------
 init_paths() {
-    mkdir -p "$STACK_DIR"/{certs,backups,state,Caddyfile.d,xray,hermes}
+    mkdir -p "$STACK_DIR"/{certs,backups,state,Caddyfile.d,xray}
     chmod 700 "$STACK_DIR" 2>/dev/null || true
     chmod 700 "$STACK_DIR/certs" "$STACK_DIR/backups" 2>/dev/null || true
     
@@ -386,11 +380,6 @@ init_paths() {
     touch "$STACK_DIR/.env"
     touch "$STACK_DIR/domains.tsv"
     touch "$STACK_DIR/Caddyfile.d/custom"
-    
-    # Ensure hermes data dir has appropriate ownership (UID 10000 for hermes)
-    if [[ "$(id -u)" -eq 0 ]]; then
-        chown -R 10000:10000 "$STACK_DIR/hermes" 2>/dev/null || true
-    fi
 }
 
 # ------------------------------------------------------------------------------
@@ -502,8 +491,6 @@ ensure_stack_secrets() {
         "JWT_SECRET:32"
         "API_KEY_SECRET:32"
         "MACHINE_ID_SALT:16"
-        "HERMES_DASHBOARD_BASIC_AUTH_SECRET:32"
-        "API_SERVER_KEY:32"
     )
     
     for item in "${secrets[@]}"; do
@@ -519,9 +506,12 @@ ensure_stack_secrets() {
         fi
     done
     
-    # Defaults for other critical 9Router / Hermes options
+    # Defaults for critical 9Router options
     if [[ -z "$(env_get "REQUIRE_API_KEY" "")" ]]; then
         env_set "REQUIRE_API_KEY" "false"
+    fi
+    if [[ -z "$(env_get "INITIAL_PASSWORD" "")" ]]; then
+        env_set "INITIAL_PASSWORD" "123456"
     fi
     if [[ -z "$(env_get "AUTH_COOKIE_SECURE" "")" ]]; then
         env_set "AUTH_COOKIE_SECURE" "true"
@@ -535,12 +525,6 @@ ensure_stack_secrets() {
     if [[ -z "$(env_get "PROXY_MODE" "")" ]]; then
         env_set "PROXY_MODE" "none"
     fi
-    if [[ -z "$(env_get "HERMES_DASHBOARD_ENABLED" "")" ]]; then
-        env_set "HERMES_DASHBOARD_ENABLED" "true"
-    fi
-    if [[ -z "$(env_get "HERMES_API_ENABLED" "")" ]]; then
-        env_set "HERMES_API_ENABLED" "true"
-    fi
     if [[ -z "$(env_get "CADDY_ENABLED" "")" ]]; then
         env_set "CADDY_ENABLED" "auto"
     fi
@@ -550,260 +534,76 @@ ensure_stack_secrets() {
 }
 
 # ------------------------------------------------------------------------------
-# Hermes config.yaml Merge & Access Subsystem
+# 9Router Client Setup & API Access Subsystem
 # ------------------------------------------------------------------------------
-# Merges model and dashboard sections without clobbering existing configuration
-# Also auto-heals any line-concatenated top-level keys (e.g. api_key: ..._config_version: 51)
-merge_hermes_config() {
-    local config_file="$STACK_DIR/hermes/config.yaml"
-    local model_name="${1:-$(env_get "DEFAULT_MODEL" "nousresearch/hermes-3-llama-3.1-8b")}"
-    local nine_router_key="${2:-$(env_get "INITIAL_PASSWORD" "123456")}"
-    local dashboard_domain="${3:-}"
-    
-    init_paths
-    
-    if [[ -z "$dashboard_domain" ]]; then
-        dashboard_domain="localhost"
-        if [[ -s "$STACK_DIR/domains.tsv" ]]; then
-            local d srv
-            while IFS=$'\t' read -r d srv _ || [[ -n "$d" ]]; do
-                [[ -z "$d" || "$d" =~ ^# ]] && continue
-                if [[ "$srv" == "hermes" || "$srv" == "both" ]]; then
-                    dashboard_domain="$d"
-                    break
-                fi
-            done < "$STACK_DIR/domains.tsv"
-        fi
-    fi
-    
-    python3 -c "
-import sys, os, re, json
-
-config_file = sys.argv[1]
-model_name = sys.argv[2]
-api_key = sys.argv[3]
-domain = sys.argv[4]
-
-content = ''
-if os.path.isfile(config_file):
-    with open(config_file, 'r', encoding='utf-8') as f:
-        content = f.read()
-
-# 1. Auto-heal previously corrupted lines where a top-level key was concatenated
-# onto an indented line (e.g. '  api_key: 123456_config_version: 51')
-content = re.sub(
-    r'(?m)^([ \t]+[A-Za-z0-9_.-]+:[ \t]*[^\n]*?)(_config_version:[ \t]*[0-9]+)',
-    r'\1\n\2',
-    content
-)
-
-# 2. Replace or append top-level YAML blocks without consuming the newline before the next key
-def replace_or_append_block(text, block_name, new_block_content):
-    # Match block_name: plus only indented lines (or blank lines followed by indented lines)
-    pattern = re.compile(
-        r'(?m)^' + re.escape(block_name) + r':[ \t]*(?:#.*)?(?:\n(?:[ \t]+.*|[ \t]*(?=\n[ \t]+\S)))*'
-    )
-    replacement = new_block_content.strip()
-    if pattern.search(text):
-        return pattern.sub(lambda _: replacement, text, count=1)
-    else:
-        trimmed = text.rstrip()
-        prefix = (trimmed + '\n\n') if trimmed else ''
-        return prefix + replacement + '\n'
-
-public_url = f'https://{domain}' if domain != 'localhost' else 'http://localhost:9119'
-
-new_model_block = f'''model:
-  default: {json.dumps(model_name)}
-  provider: \"custom\"
-  base_url: \"http://nine-router:20128/v1\"
-  api_key: {json.dumps(api_key)}'''
-
-new_dashboard_block = f'''dashboard:
-  public_url: {json.dumps(public_url)}
-  trusted_proxies:
-    - \"127.0.0.1/32\"
-    - \"172.16.0.0/12\"
-    - \"10.0.0.0/8\"'''
-
-content = replace_or_append_block(content, 'model', new_model_block)
-content = replace_or_append_block(content, 'dashboard', new_dashboard_block)
-
-# Clean trailing whitespace/excess newlines
-content = re.sub(r'\n{3,}', '\n\n', content).strip() + '\n'
-
-with open(config_file, 'w', encoding='utf-8') as f:
-    f.write(content)
-" "$config_file" "$model_name" "$nine_router_key" "$dashboard_domain"
-
-    # Set permissions so container UID 10000 can read and write
-    chmod 666 "$config_file" 2>/dev/null || true
-    if [[ "$(id -u)" -eq 0 ]]; then
-        chown 10000:10000 "$config_file" 2>/dev/null || true
-    fi
-}
-
-# Run a command inside the Hermes Agent container (attaches TTY when interactive)
-hermes_exec() {
-    init_paths
-    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^ai-stack-hermes$"; then
-        warn "Hermes Agent container is not running. Starting stack..."
-        stack_start
-    fi
-    local tty_flags="-i"
-    if [[ -t 0 ]] && [[ -t 1 ]]; then
-        tty_flags="-it"
-    fi
-    if has_tty && [[ -t 1 ]]; then
-        docker exec -it ai-stack-hermes "$@" </dev/tty
-    else
-        docker exec "$tty_flags" ai-stack-hermes "$@"
-    fi
-}
-
-# Auto-repair Hermes config.yaml and verify inside container if running
-hermes_fix_config() {
+client_access_info() {
     init_paths
     ensure_stack_secrets
-    local model
-    model=$(env_get "DEFAULT_MODEL" "nousresearch/hermes-3-llama-3.1-8b")
-    local key
-    key=$(env_get "INITIAL_PASSWORD" "123456")
-    merge_hermes_config "$model" "$key" ""
-    success "Repaired and synchronized $STACK_DIR/hermes/config.yaml"
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^ai-stack-hermes$"; then
-        docker exec ai-stack-hermes hermes config check || true
-    fi
-}
-
-# Show how to access Hermes Agent (CLI, TUI, Web UI, API, and SSH tunnel)
-hermes_access_info() {
-    init_paths
-    ensure_stack_secrets
-    local dash_en
-    dash_en=$(env_get "HERMES_DASHBOARD_ENABLED" "true")
-    local api_en
-    api_en=$(env_get "HERMES_API_ENABLED" "true")
-    local huser
-    huser=$(env_get "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "admin")
-    local hpass
-    hpass=$(env_get "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "admin123")
     local rpass
     rpass=$(env_get "INITIAL_PASSWORD" "123456")
-    local akey
-    akey=$(env_get "API_SERVER_KEY" "")
-    local srv_ip
-    srv_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    local req_key
+    req_key=$(env_get "REQUIRE_API_KEY" "false")
+    local srv_ip=""
+    if command -v ip >/dev/null 2>&1; then
+        srv_ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || true)
+    fi
+    if [[ -z "$srv_ip" ]] && command -v hostname >/dev/null 2>&1; then
+        srv_ip=$(hostname -i 2>/dev/null | awk '{print $1; exit}' || true)
+    fi
     [[ -z "$srv_ip" ]] && srv_ip="YOUR_VPS_IP"
 
+    local primary_domain=""
+    if [[ -s "$STACK_DIR/domains.tsv" ]]; then
+        primary_domain=$(awk -F'\t' '!/^#/ && NF>=1 {print $1; exit}' "$STACK_DIR/domains.tsv" 2>/dev/null || true)
+    fi
+
+    local api_url="http://127.0.0.1:20128/v1"
+    local admin_url="http://127.0.0.1:20128/admin"
+    if [[ -n "$primary_domain" ]]; then
+        api_url="https://${primary_domain}/v1"
+        admin_url="https://${primary_domain}/admin"
+    fi
+
     printf "\n  %b╭──────────────────────────────────────────────────────────────────────╮%b\n" "$C_CYAN" "$C_RESET"
-    printf "  %b│%b  %b🤖 HERMES AGENT & 9ROUTER ACCESS GUIDE%b                              %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD$C_WHITE" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b  %b🔌 9ROUTER CLIENT SETUP & API ACCESS GUIDE%b                            %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD$C_WHITE" "$C_RESET" "$C_CYAN" "$C_RESET"
     printf "  %b╰──────────────────────────────────────────────────────────────────────╯%b\n" "$C_CYAN" "$C_RESET"
-    printf "\n  %b1. Direct Terminal Access (Works anytime, even with Web UI disabled):%b\n" "$C_BOLD" "$C_RESET"
-    printf "     • Interactive Chat:       %baistack hermes chat%b\n" "$C_CYAN" "$C_RESET"
-    printf "     • Fullscreen Agent TUI:   %baistack hermes tui%b\n" "$C_CYAN" "$C_RESET"
-    printf "     • Agent Setup Wizard:     %baistack hermes setup%b  (Telegram/Discord/Slack/Tools)\n" "$C_CYAN" "$C_RESET"
-    printf "     • Edit config.yaml:       %baistack hermes config edit%b\n" "$C_CYAN" "$C_RESET"
-    printf "     • Repair config.yaml:     %baistack hermes fix-config%b\n" "$C_CYAN" "$C_RESET"
 
-    printf "\n  %b2. Web UI & API Credentials:%b\n" "$C_BOLD" "$C_RESET"
-    printf "     • 9Router Admin UI:       http://127.0.0.1:20128/admin  (Password: %b%s%b)\n" "$C_GREEN" "$rpass" "$C_RESET"
-    if [[ "$dash_en" == "true" ]]; then
-        printf "     • Hermes Web UI:          http://127.0.0.1:9119         (User: %b%s%b / Pass: %b%s%b)\n" "$C_GREEN" "$huser" "$C_RESET" "$C_GREEN" "$hpass" "$C_RESET"
+    printf "\n  %b1. 9Router Endpoints & Credentials:%b\n" "$C_BOLD" "$C_RESET"
+    printf "     • Web Admin UI:     %b%s%b\n" "$C_GREEN" "$admin_url" "$C_RESET"
+    printf "       Initial Password: %b%s%b\n" "$C_YELLOW" "$rpass" "$C_RESET"
+    printf "     • OpenAI Base URL:  %b%s%b\n" "$C_GREEN" "$api_url" "$C_RESET"
+    if [[ "$req_key" == "true" ]]; then
+        printf "     • API Key:          %bCustom%b (Manage & generate keys in 9Router UI)\n" "$C_YELLOW" "$C_RESET"
     else
-        printf "     • Hermes Web UI:          %bDisabled%b (Enable via: %baistack features dashboard on && aistack restart%b)\n" "$C_YELLOW" "$C_RESET" "$C_CYAN" "$C_RESET"
-    fi
-    if [[ "$api_en" == "true" ]]; then
-        printf "     • Hermes OpenAI API:      http://127.0.0.1:8642/v1      (Bearer Key: %b%s%b)\n" "$C_GREEN" "$akey" "$C_RESET"
+        printf "     • Default API Key:  %bsk_9router%b (Or create custom keys in 9Router UI)\n" "$C_CYAN" "$C_RESET"
     fi
 
-    printf "\n  %b3. Remote Access from Your Laptop (SSH Port-Forwarding):%b\n" "$C_BOLD" "$C_RESET"
-    printf "     Run this on your laptop terminal to open both dashboards locally:\n"
-    printf "     %bssh -L 9119:127.0.0.1:9119 -L 20128:127.0.0.1:20128 root@%s%b\n" "$C_CYAN" "$srv_ip" "$C_RESET"
-    printf "     Then open %bhttp://localhost:9119%b (Hermes) and %bhttp://localhost:20128/admin%b (9Router).\n" "$C_GREEN" "$C_RESET" "$C_GREEN" "$C_RESET"
-    printf "     (Or expose them over HTTPS via: %baistack domain add%b)\n\n" "$C_CYAN" "$C_RESET"
+    printf "\n  %b2. How to Connect Hermes Agent (Manual Setup):%b\n" "$C_BOLD" "$C_RESET"
+    printf "     On the client/host running Hermes Agent, configure it with:\n"
+    printf "     %bhermes config set model.provider custom%b\n" "$C_CYAN" "$C_RESET"
+    printf "     %bhermes config set model.base_url \"%s\"%b\n" "$C_CYAN" "$api_url" "$C_RESET"
+    printf "     %bhermes config set model.api_key \"sk_9router\"%b\n" "$C_CYAN" "$C_RESET"
+    printf "     %bhermes config set model.default \"<model-name>\"%b  # e.g. gpt-4o, claude-3-5-sonnet\n" "$C_CYAN" "$C_RESET"
+    printf "     %bhermes chat%b\n" "$C_GREEN" "$C_RESET"
+
+    printf "\n  %b3. How to Connect Cursor / Cline / Roo / Claude Code:%b\n" "$C_BOLD" "$C_RESET"
+    printf "     • Provider / API:   OpenAI Compatible\n"
+    printf "     • Base URL:         %b%s%b\n" "$C_GREEN" "$api_url" "$C_RESET"
+    printf "     • API Key:          %bsk_9router%b\n" "$C_GREEN" "$C_RESET"
+
+    printf "\n  %b4. SSH Port-Forwarding (If domain is not configured):%b\n" "$C_BOLD" "$C_RESET"
+    printf "     Run this on your laptop to securely forward 9Router ports:\n"
+    printf "     %bssh -N -L 20128:127.0.0.1:20128 root@%s%b\n" "$C_CYAN" "$srv_ip" "$C_RESET"
+    printf "     Then access locally at: %bhttp://localhost:20128/admin%b and %bhttp://localhost:20128/v1%b\n" "$C_GREEN" "$C_RESET" "$C_GREEN" "$C_RESET"
+
+    printf "\n  %b5. Quick Connection Test (cURL):%b\n" "$C_BOLD" "$C_RESET"
+    printf "     %bcurl -s %s/models -H \"Authorization: Bearer sk_9router\"%b\n\n" "$C_DIM" "$api_url" "$C_RESET"
 }
 
-# Edit Hermes config.yaml safely on host and validate
-hermes_edit_config() {
-    init_paths
-    hermes_fix_config >/dev/null 2>&1 || true
-    local cfg="$STACK_DIR/hermes/config.yaml"
-    local editor="${EDITOR:-nano}"
-    if ! command -v "$editor" >/dev/null 2>&1; then
-        command -v vi >/dev/null 2>&1 && editor="vi"
-    fi
-    if has_tty; then
-        "$editor" "$cfg" </dev/tty >/dev/tty
-    else
-        "$editor" "$cfg"
-    fi
-    hermes_fix_config
-}
-
-# CLI dispatcher for 'aistack hermes ...'
+# Compatibility wrapper when user runs 'aistack hermes ...'
 hermes_cli() {
-    init_paths
-    # Always heal config.yaml before running any hermes command
-    merge_hermes_config >/dev/null 2>&1 || true
-    local sub="${1:-status}"
-    shift || true
-    case "$sub" in
-        chat)
-            hermes_exec hermes chat "$@"
-            ;;
-        tui)
-            hermes_exec hermes --tui "$@"
-            ;;
-        setup)
-            hermes_exec hermes setup "$@"
-            ;;
-        model)
-            if [[ $# -gt 0 ]]; then
-                env_set "DEFAULT_MODEL" "$1"
-                merge_hermes_config "$1" "$(env_get "INITIAL_PASSWORD" "123456")" ""
-                success "Default Hermes model updated to: $1"
-            else
-                hermes_exec hermes model
-            fi
-            ;;
-        config)
-            local csub="${1:-show}"
-            shift || true
-            case "$csub" in
-                edit)  hermes_edit_config ;;
-                fix)   hermes_fix_config ;;
-                check) hermes_exec hermes config check ;;
-                set)   hermes_exec hermes config set "$@"; merge_hermes_config >/dev/null 2>&1 || true ;;
-                show|*) hermes_exec hermes config "$csub" "$@" ;;
-            esac
-            ;;
-        fix-config|repair)
-            hermes_fix_config
-            ;;
-        access|info)
-            hermes_access_info
-            ;;
-        status)
-            hermes_access_info
-            if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^ai-stack-hermes$"; then
-                hermes_exec hermes status
-            fi
-            ;;
-        doctor)
-            hermes_exec hermes doctor "$@"
-            ;;
-        shell|sh|bash)
-            hermes_exec bash "$@"
-            ;;
-        exec)
-            hermes_exec "$@"
-            ;;
-        *)
-            # Forward any other native hermes CLI subcommands (e.g. skills, plugins, cron, sessions)
-            hermes_exec hermes "$sub" "$@"
-            ;;
-    esac
+    info "Hermes Agent runs manually/externally in this architecture."
+    client_access_info
 }
 
 # ------------------------------------------------------------------------------
@@ -1431,7 +1231,6 @@ bundle_export() {
     
     local images=(
         "decolua/9router:latest"
-        "nousresearch/hermes-agent:latest"
         "caddy:2-alpine"
         "teddysun/xray:latest"
     )
@@ -1497,16 +1296,15 @@ print(provider)
 " "$domain"
 }
 
-# Print a clear visual guide explaining Domain Services and SSL/TLS Modes
+# Print a clear visual guide explaining Domain Routing and SSL/TLS Modes
 domain_explain_guide() {
     printf "\n  %b╭──────────────────────────────────────────────────────────────────────╮%b\n" "$C_CYAN" "$C_RESET"
     printf "  %b│%b  %b🌐 DOMAIN ROUTING & SSL/TLS QUICK GUIDE%b                             %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD$C_WHITE" "$C_RESET" "$C_CYAN" "$C_RESET"
     printf "  %b├──────────────────────────────────────────────────────────────────────┤%b\n" "$C_CYAN" "$C_RESET"
-    printf "  %b│%b  %b1. Which Service Should I Expose?%b                                   %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
-    printf "  %b│%b     • %bBoth (Recommended)%b: Exposes Hermes Web UI at %bhttps://domain/%b   %b│%b\n" "$C_CYAN" "$C_RESET" "$C_GREEN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
-    printf "  %b│%b       and 9Router OpenAI API at %bhttps://domain/v1/*%b on one domain.   %b│%b\n" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
-    printf "  %b│%b     • %b9Router Only%b:       Exposes 9Router Admin UI & OpenAI API.     %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
-    printf "  %b│%b     • %bHermes Only%b:        Exposes Hermes Agent Web UI only.          %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b  %b1. What Does a Domain Expose?%b                                       %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b     All configured domains route directly to %b9Router%b:                 %b│%b\n" "$C_CYAN" "$C_RESET" "$C_GREEN" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b     • %bhttps://<domain>/admin%b  → 9Router Web Admin UI                   %b│%b\n" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b     • %bhttps://<domain>/v1/*%b   → OpenAI-Compatible AI API Endpoint      %b│%b\n" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
     printf "  %b├──────────────────────────────────────────────────────────────────────┤%b\n" "$C_CYAN" "$C_RESET"
     printf "  %b│%b  %b2. Which SSL / TLS Mode Should I Pick?%b                              %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
     printf "  %b│%b     • %bAuto TLS (Let's Encrypt / ZeroSSL)%b:                            %b│%b\n" "$C_CYAN" "$C_RESET" "$C_GREEN" "$C_RESET" "$C_CYAN" "$C_RESET"
@@ -1577,28 +1375,15 @@ if os.path.exists(domains_tsv):
                 lines.append('        issuer acme')
                 lines.append('    }')
                 
-            # Service routing
-            if service == '9router':
-                lines.append('    reverse_proxy nine-router:20128')
-            elif service == 'hermes':
-                lines.append('    reverse_proxy hermes:9119')
-            elif service == 'both':
-                lines.append('    handle /api/v1/* {')
-                lines.append('        reverse_proxy nine-router:20128')
-                lines.append('    }')
-                lines.append('    handle /v1/* {')
-                lines.append('        reverse_proxy nine-router:20128')
-                lines.append('    }')
-                lines.append('    handle {')
-                lines.append('        reverse_proxy hermes:9119')
-                lines.append('    }')
+            # All domains proxy directly to 9Router
+            lines.append('    reverse_proxy nine-router:20128')
             lines.append('}')
             lines.append('')
 
 if not has_domains:
     # Default fallback block for port 80/443 when no domain configured yet
     lines.append(':80 {')
-    lines.append('    respond \"AI Stack is running. Add a domain using: manage.sh domain add\" 200')
+    lines.append('    respond \"9Router Stack is running. Add a domain using: aistack domain add\" 200')
     lines.append('}')
     lines.append('')
 
@@ -1633,26 +1418,20 @@ domain_list() {
     local domains_tsv="$STACK_DIR/domains.tsv"
     
     printf "\n%bConfigured Domains & Routes:%b\n" "$C_BOLD" "$C_RESET"
-    printf "  %-26s %-24s %-12s %-14s\n" "DOMAIN" "ROUTED TARGET" "TLS MODE" "DNS / CDN"
-    printf "  %-26s %-24s %-12s %-14s\n" "--------------------------" "------------------------" "------------" "--------------"
+    printf "  %-28s %-22s %-12s %-14s\n" "DOMAIN" "ROUTED TARGET" "TLS MODE" "DNS / CDN"
+    printf "  %-28s %-22s %-12s %-14s\n" "----------------------------" "----------------------" "------------" "--------------"
     
     local count=0
     while IFS=$'\t' read -r dom srv tls cert key || [[ -n "$dom" ]]; do
         [[ -z "$dom" || "$dom" =~ ^# ]] && continue
         local cdn
         cdn=$(check_cdn_provider "$dom")
-        local route_desc="$srv"
-        case "$srv" in
-            9router) route_desc="9Router (:20128)" ;;
-            hermes)  route_desc="Hermes Web UI (:9119)" ;;
-            both)    route_desc="Hermes (/) + 9Router (/v1)" ;;
-        esac
-        printf "  %-26s %-24s %-12s %-14s\n" "$dom" "$route_desc" "$tls" "$cdn"
+        printf "  %-28s %-22s %-12s %-14s\n" "$dom" "9Router (:20128)" "$tls" "$cdn"
         ((count++)) || true
     done < "$domains_tsv"
     
     if [[ $count -eq 0 ]]; then
-        printf "  %b(No custom domains configured — services listen on 127.0.0.1 only)%b\n" "$C_DIM" "$C_RESET"
+        printf "  %b(No custom domains configured — 9Router listens on 127.0.0.1:20128 only)%b\n" "$C_DIM" "$C_RESET"
     fi
     printf "\n"
 }
@@ -1661,8 +1440,8 @@ domain_list() {
 domain_add() {
     init_paths
     local domain="${1:-}"
-    local service="${2:-}"
-    local tls_mode="${3:-}"
+    local tls_mode="${2:-}"
+    local service="9router"
     
     if [[ -z "$domain" ]]; then
         domain_explain_guide
@@ -1684,7 +1463,7 @@ domain_add() {
     # If domain already exists, offer to update/replace it in interactive mode
     if grep -q "^${domain}[[:space:]]" "$STACK_DIR/domains.tsv" 2>/dev/null; then
         if is_interactive_tty && [[ -z "${2:-}" ]]; then
-            if tui_confirm "Domain '$domain' is already configured. Update its routing/SSL settings?" "y"; then
+            if tui_confirm "Domain '$domain' is already configured. Update its SSL settings?" "y"; then
                 sed -i "/^${domain}[[:space:]]/d" "$STACK_DIR/domains.tsv"
             else
                 return 1
@@ -1704,32 +1483,13 @@ domain_add() {
         info "DNS check: '$domain' resolves via $cdn"
     fi
     
-    if [[ -z "$service" ]]; then
-        TUI_DEFAULT_INDEX=0 tui_select "Step 1/2 — What should https://$domain serve?" \
-            "Both (Unified) — Hermes Web UI at / and 9Router OpenAI API at /v1/* (Recommended)" \
-            "9Router Only   — 9Router Admin Dashboard (/admin) & OpenAI API (/v1/*)" \
-            "Hermes Only    — Hermes Agent Web Dashboard & Chat UI (:9119)" || return 1
-        case "$TUI_CHOICE" in
-            0) service="both" ;;
-            1) service="9router" ;;
-            2) service="hermes" ;;
-        esac
-    fi
-    
-    if [[ "$service" == "hermes" || "$service" == "both" ]]; then
-        if [[ "$(env_get "HERMES_DASHBOARD_ENABLED" "true")" != "true" ]]; then
-            info "Enabling Hermes Web UI (Port 9119) so https://$domain can reach it..."
-            env_set "HERMES_DASHBOARD_ENABLED" "true"
-        fi
-    fi
-    
     if [[ -z "$tls_mode" ]]; then
         local pre_tls=0
         if [[ "$cdn" == "Cloudflare" ]] || [[ "$cdn" == "ArvanCloud" ]]; then
             info "CDN ($cdn) proxy detected: choose 'Origin Certificate' for Full (Strict) SSL, or 'Auto TLS' if DNS-only."
             pre_tls=1
         fi
-        TUI_DEFAULT_INDEX="$pre_tls" tui_select "Step 2/2 — Select SSL/TLS Certificate Mode for $domain" \
+        TUI_DEFAULT_INDEX="$pre_tls" tui_select "Select SSL/TLS Certificate Mode for $domain" \
             "Auto TLS (Let's Encrypt / ZeroSSL) — Automatic free SSL (Requires ports 80/443 open)" \
             "Origin Certificate (Cloudflare/Arvan) — Paste PEM cert & private key from CDN panel" \
             "Internal Self-Signed TLS            — For local networks, Tailscale, or testing" || return 1
@@ -1778,15 +1538,6 @@ domain_add() {
     printf "%s\t%s\t%s\t%s\t%s\n" "$domain" "$service" "$tls_mode" "$cert_file" "$key_file" >> "$STACK_DIR/domains.tsv"
     generate_caddyfile
     
-    # If hermes is exposed, update hermes config dashboard domain
-    if [[ "$service" == "hermes" || "$service" == "both" ]]; then
-        local current_model
-        current_model=$(env_get "DEFAULT_MODEL" "nousresearch/hermes-3-llama-3.1-8b")
-        local current_key
-        current_key=$(env_get "INITIAL_PASSWORD" "123456")
-        merge_hermes_config "$current_model" "$current_key" "$domain"
-    fi
-    
     generate_docker_compose
     if ! docker compose -f "$STACK_DIR/docker-compose.yml" ps --services --filter "status=running" 2>/dev/null | grep -q "^caddy$"; then
         if docker compose -f "$STACK_DIR/docker-compose.yml" ps --services --filter "status=running" 2>/dev/null | grep -q "^nine-router$"; then
@@ -1796,7 +1547,7 @@ domain_add() {
     else
         caddy_reload
     fi
-    success "Domain https://$domain configured (Target: $service, TLS: $tls_mode)."
+    success "Domain https://$domain configured (Routes to 9Router, TLS: $tls_mode)."
 }
 
 # Remove a domain
@@ -1838,20 +1589,17 @@ domain_rm() {
 features_status() {
     init_paths
     ensure_stack_secrets
-    local dash_en
-    dash_en=$(env_get "HERMES_DASHBOARD_ENABLED" "true")
-    local api_en
-    api_en=$(env_get "HERMES_API_ENABLED" "true")
     local caddy_en
     caddy_en=$(env_get "CADDY_ENABLED" "auto")
     local router_mem
     router_mem=$(env_get "NINE_ROUTER_MAX_MEM" "256")
+    local req_key
+    req_key=$(env_get "REQUIRE_API_KEY" "false")
     
     printf "%bOptional Features & Resource Limits:%b\n" "$C_BOLD" "$C_RESET"
-    printf "  Hermes Web UI (Port 9119):  %s\n" "$([[ "$dash_en" == "true" ]] && printf "%bEnabled%b" "$C_GREEN" "$C_RESET" || printf "%bDisabled (Lightweight)%b" "$C_YELLOW" "$C_RESET")"
-    printf "  Hermes API (Port 8642):     %s\n" "$([[ "$api_en" == "true" ]] && printf "%bEnabled%b" "$C_GREEN" "$C_RESET" || printf "%bDisabled (Lightweight)%b" "$C_YELLOW" "$C_RESET")"
     printf "  Caddy Reverse Proxy:        %s\n" "$caddy_en (auto = runs only when domains exist)"
     printf "  9Router V8 Heap Cap:        %s MB\n" "$router_mem"
+    printf "  Require API Key Auth:       %s\n" "$([[ "$req_key" == "true" ]] && printf "%bEnforced%b" "$C_GREEN" "$C_RESET" || printf "%bOff (Default sk_9router permitted)%b" "$C_YELLOW" "$C_RESET")"
 }
 
 features_set() {
@@ -1860,20 +1608,6 @@ features_set() {
     local val="${2:-}"
     
     case "$feature" in
-        dashboard)
-            case "$val" in
-                on|true|1)  env_set "HERMES_DASHBOARD_ENABLED" "true"; success "Hermes Web UI enabled." ;;
-                off|false|0) env_set "HERMES_DASHBOARD_ENABLED" "false"; success "Hermes Web UI disabled (lightweight mode)." ;;
-                *) die "Usage: $SCRIPT_NAME features dashboard <on|off>" ;;
-            esac
-            ;;
-        api)
-            case "$val" in
-                on|true|1)  env_set "HERMES_API_ENABLED" "true"; success "Hermes API server enabled." ;;
-                off|false|0) env_set "HERMES_API_ENABLED" "false"; success "Hermes API server disabled (lightweight mode)." ;;
-                *) die "Usage: $SCRIPT_NAME features api <on|off>" ;;
-            esac
-            ;;
         caddy)
             case "$val" in
                 auto)        env_set "CADDY_ENABLED" "auto"; success "Caddy set to auto (runs only when domains are configured)." ;;
@@ -1890,8 +1624,15 @@ features_set() {
                 die "Usage: $SCRIPT_NAME features memory <megabytes> (min: 128)"
             fi
             ;;
+        auth|require-key|require_key)
+            case "$val" in
+                on|true|1)  env_set "REQUIRE_API_KEY" "true"; success "API key enforcement enabled." ;;
+                off|false|0) env_set "REQUIRE_API_KEY" "false"; success "API key enforcement disabled (default key permitted)." ;;
+                *) die "Usage: $SCRIPT_NAME features require-key <on|off>" ;;
+            esac
+            ;;
         *)
-            die "Usage: $SCRIPT_NAME features <status|dashboard|api|caddy|memory> [value]"
+            die "Usage: $SCRIPT_NAME features <status|caddy|memory|require-key> [value]"
             ;;
     esac
     generate_docker_compose
@@ -1926,19 +1667,6 @@ generate_docker_compose() {
     local auth_cookie_secure
     auth_cookie_secure=$(env_get "AUTH_COOKIE_SECURE" "true")
     
-    local hermes_user
-    hermes_user=$(env_get "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "admin")
-    local hermes_pass
-    hermes_pass=$(env_get "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "admin123")
-    local hermes_secret
-    hermes_secret=$(env_get "HERMES_DASHBOARD_BASIC_AUTH_SECRET")
-    local api_server_key
-    api_server_key=$(env_get "API_SERVER_KEY")
-    
-    local dash_enabled
-    dash_enabled=$(env_get "HERMES_DASHBOARD_ENABLED" "true")
-    local api_enabled
-    api_enabled=$(env_get "HERMES_API_ENABLED" "true")
     local caddy_enabled
     caddy_enabled=$(env_get "CADDY_ENABLED" "auto")
     local router_max_mem
@@ -1959,16 +1687,9 @@ initial_password = sys.argv[8]
 require_api_key = sys.argv[9]
 auth_cookie_secure = sys.argv[10]
 
-hermes_user = sys.argv[11]
-hermes_pass = sys.argv[12]
-hermes_secret = sys.argv[13]
-api_server_key = sys.argv[14]
-stack_dir = sys.argv[15]
-
-dash_enabled = sys.argv[16] == 'true'
-api_enabled = sys.argv[17] == 'true'
-caddy_mode = sys.argv[18]
-router_max_mem = sys.argv[19]
+stack_dir = sys.argv[11]
+caddy_mode = sys.argv[12]
+router_max_mem = sys.argv[13]
 
 http_proxy_val = ''
 socks_proxy_val = ''
@@ -1990,8 +1711,8 @@ if http_proxy_val:
       - all_proxy={socks_proxy_val}
       - NODE_USE_ENV_PROXY=1
       - GLOBAL_AGENT_HTTP_PROXY={http_proxy_val}
-      - NO_PROXY=localhost,127.0.0.1,nine-router,hermes,caddy,xray,172.16.0.0/12,192.168.0.0/16,.ir
-      - no_proxy=localhost,127.0.0.1,nine-router,hermes,caddy,xray,172.16.0.0/12,192.168.0.0/16,.ir'''
+      - NO_PROXY=localhost,127.0.0.1,nine-router,caddy,xray,172.16.0.0/12,192.168.0.0/16,.ir
+      - no_proxy=localhost,127.0.0.1,nine-router,caddy,xray,172.16.0.0/12,192.168.0.0/16,.ir'''
 
 xray_service_block = ''
 if proxy_enabled and proxy_mode == 'xray':
@@ -2015,18 +1736,6 @@ if proxy_enabled and proxy_mode == 'xray':
         max-size: \"5m\"
         max-file: \"2\"
 '''
-
-# Build Hermes ports and healthcheck based on enabled optional features
-hermes_ports = []
-if dash_enabled:
-    hermes_ports.append('      - \"127.0.0.1:9119:9119\"')
-if api_enabled:
-    hermes_ports.append('      - \"127.0.0.1:8642:8642\"')
-hermes_ports_block = ('    ports:\n' + '\n'.join(hermes_ports)) if hermes_ports else ''
-
-hermes_dash_flag = '1' if dash_enabled else '0'
-hermes_api_flag = 'true' if api_enabled else 'false'
-hermes_hc_cmd = 'curl -f http://localhost:9119/ || exit 1' if dash_enabled else 'pgrep -f hermes >/dev/null || exit 1'
 
 # Decide whether Caddy runs
 has_domains = False
@@ -2102,39 +1811,6 @@ services:
       options:
         max-size: \"5m\"
         max-file: \"2\"
-
-  hermes:
-    image: nousresearch/hermes-agent:latest
-    container_name: ai-stack-hermes
-    restart: unless-stopped
-    command: gateway run
-{hermes_ports_block}
-    environment:
-      - PYTHONDONTWRITEBYTECODE=1
-      - PYTHONUNBUFFERED=1
-      - PIP_NO_CACHE_DIR=1
-      - MALLOC_TRIM_THRESHOLD_=65536
-      - HERMES_DASHBOARD={hermes_dash_flag}
-      - HERMES_DASHBOARD_BASIC_AUTH_USERNAME={hermes_user}
-      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD={hermes_pass}
-      - HERMES_DASHBOARD_BASIC_AUTH_SECRET={hermes_secret}
-      - API_SERVER_ENABLED={hermes_api_flag}
-      - API_SERVER_HOST=0.0.0.0
-      - API_SERVER_KEY={api_server_key}
-{proxy_env_block}
-    volumes:
-      - {stack_dir}/hermes:/opt/data
-    healthcheck:
-      test: [\"CMD-SHELL\", \"{hermes_hc_cmd}\"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    logging:
-      driver: json-file
-      options:
-        max-size: \"5m\"
-        max-file: \"2\"
 {caddy_service_block}
 volumes:
   nine_router_data:
@@ -2147,8 +1823,7 @@ with open(out, 'w', encoding='utf-8') as f:
 " "$compose_file" "$proxy_enabled" "$proxy_mode" "$proxy_url" \
   "$jwt_secret" "$api_key_secret" "$machine_id_salt" "$initial_password" \
   "$require_api_key" "$auth_cookie_secure" \
-  "$hermes_user" "$hermes_pass" "$hermes_secret" "$api_server_key" \
-  "$STACK_DIR" "$dash_enabled" "$api_enabled" "$caddy_enabled" "$router_max_mem"
+  "$STACK_DIR" "$caddy_enabled" "$router_max_mem"
 
     chmod 600 "$compose_file" 2>/dev/null || true
 }
@@ -2169,7 +1844,7 @@ stack_preflight() {
     fi
     
     # Check port collisions (ignoring containers that belong to ai-stack)
-    local check_ports=("80" "443" "20128" "9119" "8642")
+    local check_ports=("80" "443" "20128")
     for port in "${check_ports[@]}"; do
         if command -v ss >/dev/null 2>&1; then
             if ss -tlpn | grep -q ":${port} " && ! ss -tlpn | grep ":${port} " | grep -q "docker-proxy"; then
@@ -2190,9 +1865,6 @@ save_current_digests() {
 stack_start() {
     init_paths
     stack_preflight
-    
-    # Ensure Hermes config.yaml is valid and synchronized before starting
-    merge_hermes_config >/dev/null 2>&1 || true
     
     if [[ "$(env_get "PROXY_MODE" "")" == "xray" ]]; then
         xray_generate_config
@@ -2347,7 +2019,6 @@ backup_create() {
     cp -a "$STACK_DIR/domains.tsv" "$temp_stage/config/" 2>/dev/null || true
     cp -a "$STACK_DIR/certs" "$temp_stage/config/" 2>/dev/null || true
     cp -a "$STACK_DIR/xray" "$temp_stage/config/" 2>/dev/null || true
-    cp -a "$STACK_DIR/hermes" "$temp_stage/config/" 2>/dev/null || true
     cp -a "$STACK_DIR/Caddyfile.d" "$temp_stage/config/" 2>/dev/null || true
     
     # 5. Pack archive
@@ -2432,7 +2103,6 @@ backup_restore() {
         cp -a "$temp_stage/config/domains.tsv" "$STACK_DIR/domains.tsv" 2>/dev/null || true
         cp -a "$temp_stage/config/certs" "$STACK_DIR/" 2>/dev/null || true
         cp -a "$temp_stage/config/xray" "$STACK_DIR/" 2>/dev/null || true
-        cp -a "$temp_stage/config/hermes" "$STACK_DIR/" 2>/dev/null || true
         cp -a "$temp_stage/config/Caddyfile.d" "$STACK_DIR/" 2>/dev/null || true
     fi
     
@@ -2451,9 +2121,6 @@ backup_restore() {
     
     # Fix permissions
     chmod 600 "$STACK_DIR/.env" 2>/dev/null || true
-    if [[ "$(id -u)" -eq 0 ]]; then
-        chown -R 10000:10000 "$STACK_DIR/hermes" 2>/dev/null || true
-    fi
     
     stack_start
     success "Stack successfully restored from $target"
@@ -2485,7 +2152,7 @@ stack_status() {
     printf "%-25s %-15s %-12s %-20s\n" "SERVICE" "STATUS" "HEALTH" "PORTS"
     printf "%-25s %-15s %-12s %-20s\n" "-------------------------" "---------------" "------------" "--------------------"
     
-    local services=("nine-router" "hermes" "caddy")
+    local services=("nine-router" "caddy")
     if [[ "$(env_get "PROXY_MODE" "")" == "xray" ]]; then
         services+=("xray")
     fi
@@ -2523,20 +2190,13 @@ stack_status() {
     # 3. Domains summary
     domain_list
     
-    # 4. Storage & Hermes info
+    # 4. Storage & 9Router info
     local disk_usage
     disk_usage=$(du -sh "$STACK_DIR" 2>/dev/null | cut -f1 || echo "unknown")
-    local active_model
-    active_model=$(env_get "DEFAULT_MODEL" "nousresearch/hermes-3-llama-3.1-8b")
     
     printf "%bStack Directory:%b %s (%s)\n" "$C_BOLD" "$C_RESET" "$STACK_DIR" "$disk_usage"
-    printf "%bHermes Model:%b    %s\n" "$C_BOLD" "$C_RESET" "$active_model"
-    printf "%b9Router Admin:%b    http://localhost:20128/admin (Initial password: %s)\n" "$C_BOLD" "$C_RESET" "$(env_get "INITIAL_PASSWORD" "123456")"
-    if [[ "$(env_get "HERMES_DASHBOARD_ENABLED" "true")" == "true" ]]; then
-        printf "%bHermes Portal:%b    http://localhost:9119 (User: %s / Pass: %s)\n" "$C_BOLD" "$C_RESET" "$(env_get "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "admin")" "$(env_get "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "admin123")"
-    else
-        printf "%bHermes Portal:%b    %bDisabled (Lightweight mode)%b\n" "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
-    fi
+    printf "%b9Router Admin:%b   http://localhost:20128/admin (Initial password: %s)\n" "$C_BOLD" "$C_RESET" "$(env_get "INITIAL_PASSWORD" "123456")"
+    printf "%bOpenAI API Base:%b http://localhost:20128/v1\n" "$C_BOLD" "$C_RESET"
     printf "\n"
 }
 
@@ -2552,8 +2212,8 @@ stack_doctor() {
     local avail_ram
     avail_ram=$(free -m 2>/dev/null | awk '/^Mem:/{print $7}' || echo "0")
     
-    if [[ "$total_ram" -lt 1800 ]]; then
-        warn "  Low total RAM: ${total_ram}MB. Hermes Agent gateway recommends at least 2GB RAM."
+    if [[ "$total_ram" -lt 950 ]]; then
+        warn "  Low total RAM: ${total_ram}MB. 9Router + Caddy recommend at least 1GB RAM."
         ((issues++)) || true
     else
         success "  RAM: ${total_ram}MB total, ${avail_ram}MB available."
@@ -2677,7 +2337,7 @@ stack_setup() {
     
     printf "\n"
     printf "  %b╭──────────────────────────────────────────────────────────────────────╮%b\n" "$C_CYAN" "$C_RESET"
-    printf "  %b│%b  %b🚀 HERMES STACK SMART SETUP WIZARD%b                                 %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD$C_WHITE" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b  %b🚀 NINE-STACK SMART SETUP WIZARD%b                                   %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD$C_WHITE" "$C_RESET" "$C_CYAN" "$C_RESET"
     printf "  %b│%b  %bDirectory:%b %-56s %b│%b\n" "$C_CYAN" "$C_RESET" "$C_DIM" "$C_RESET" "$STACK_DIR" "$C_CYAN" "$C_RESET"
     printf "  %b╰──────────────────────────────────────────────────────────────────────╯%b\n" "$C_CYAN" "$C_RESET"
     
@@ -2732,65 +2392,46 @@ stack_setup() {
         success "Environment set to: International VPS"
     fi
     
-    # Step 2: Resource & Feature Profile
-    tui_select "Step 2/5 — Select Resource & Feature Profile" \
-        "Standard Mode    — 9Router + Hermes Agent + Hermes Web UI & API (Recommended)" \
-        "Lightweight Mode — Disable Hermes Web UI (Port 9119) to save RAM" \
-        "Ultra-Light Mode — Headless Agent only (No Hermes Web UI or API, 192MB heap cap)" || return 1
+    # Step 2: Resource & Memory Profile
+    tui_select "Step 2/5 — Select 9Router V8 Heap Memory Cap" \
+        "256 MB — Balanced Default (Recommended for 1GB–2GB RAM VPS)" \
+        "192 MB — Ultra-Lightweight (Minimal memory footprint)" \
+        "512 MB — High Concurrency (For high-load multi-client VPS)" || return 1
     
     case "$TUI_CHOICE" in
         1)
-            env_set "HERMES_DASHBOARD_ENABLED" "false"
-            env_set "HERMES_API_ENABLED" "true"
-            env_set "NINE_ROUTER_MAX_MEM" "256"
-            success "Profile: Lightweight Mode (Hermes Web UI disabled)."
+            env_set "NINE_ROUTER_MAX_MEM" "192"
+            success "Profile: Ultra-Lightweight (192MB heap cap)."
             ;;
         2)
-            env_set "HERMES_DASHBOARD_ENABLED" "false"
-            env_set "HERMES_API_ENABLED" "false"
-            env_set "NINE_ROUTER_MAX_MEM" "192"
-            success "Profile: Ultra-Light Mode (Hermes Web UI & API disabled, 192MB heap cap)."
+            env_set "NINE_ROUTER_MAX_MEM" "512"
+            success "Profile: High Concurrency (512MB heap cap)."
             ;;
         *)
-            env_set "HERMES_DASHBOARD_ENABLED" "true"
-            env_set "HERMES_API_ENABLED" "true"
             env_set "NINE_ROUTER_MAX_MEM" "256"
-            success "Profile: Standard Mode."
+            success "Profile: Balanced Default (256MB heap cap)."
             ;;
     esac
     
-    # Step 3: Credentials & AI Model
-    printf "\n  %b▸ Step 3/5 — Credentials & Default AI Model%b\n" "$C_BOLD$C_CYAN" "$C_RESET"
+    # Step 3: 9Router Credentials & API Key Enforcement
+    printf "\n  %b▸ Step 3/5 — 9Router Credentials & Authentication%b\n" "$C_BOLD$C_CYAN" "$C_RESET"
     local cur_pass
     cur_pass=$(env_get "INITIAL_PASSWORD" "123456")
     local in_pass=""
-    tui_input "9Router Admin Password" "$cur_pass" in_pass
+    tui_input "9Router Admin UI Password" "$cur_pass" in_pass
     env_set "INITIAL_PASSWORD" "$in_pass"
     
-    if [[ "$(env_get "HERMES_DASHBOARD_ENABLED" "true")" == "true" ]]; then
-        local cur_huser
-        cur_huser=$(env_get "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "admin")
-        local in_huser=""
-        tui_input "Hermes Web UI Username" "$cur_huser" in_huser
-        env_set "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "$in_huser"
-        
-        local cur_hpass
-        cur_hpass=$(env_get "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "admin123")
-        local in_hpass=""
-        tui_input "Hermes Web UI Password" "$cur_hpass" in_hpass
-        env_set "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "$in_hpass"
+    if tui_confirm "Enforce strict API keys? (If no, sk_9router works out of the box)" "n"; then
+        env_set "REQUIRE_API_KEY" "true"
+        success "API key enforcement enabled."
+    else
+        env_set "REQUIRE_API_KEY" "false"
+        success "Permissive mode enabled (Default key 'sk_9router' accepted)."
     fi
-    
-    local cur_model
-    cur_model=$(env_get "DEFAULT_MODEL" "nousresearch/hermes-3-llama-3.1-8b")
-    local final_model=""
-    tui_input "Default AI Model" "$cur_model" final_model
-    env_set "DEFAULT_MODEL" "$final_model"
-    merge_hermes_config "$final_model" "$(env_get "INITIAL_PASSWORD" "123456")" "localhost"
     
     # Step 4: Domain Configuration
     if tui_confirm "Step 4/5 — Would you like to configure a custom domain & SSL now?" "n"; then
-        domain_add "" "" "" || true
+        domain_add "" "" || true
     fi
     
     # Step 5: Install CLI shortcut & Start Stack
@@ -2803,17 +2444,13 @@ stack_setup() {
     printf "  %b│%b  %b✔ SETUP COMPLETED SUCCESSFULLY%b                                     %b│%b\n" "$C_GREEN" "$C_RESET" "$C_BOLD$C_GREEN" "$C_RESET" "$C_GREEN" "$C_RESET"
     printf "  %b├──────────────────────────────────────────────────────────────────────┤%b\n" "$C_GREEN" "$C_RESET"
     printf "  %b│%b  • %b9Router Admin:%b  http://localhost:20128/admin (Pass: %s)\n" "$C_GREEN" "$C_RESET" "$C_BOLD" "$C_RESET" "$(env_get "INITIAL_PASSWORD" "123456")"
-    if [[ "$(env_get "HERMES_DASHBOARD_ENABLED" "true")" == "true" ]]; then
-        printf "  %b│%b  • %bHermes Web UI:%b  http://localhost:9119 (User: %s / Pass: %s)\n" \
-            "$C_GREEN" "$C_RESET" "$C_BOLD" "$C_RESET" "$(env_get "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "admin")" "$(env_get "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "admin123")"
-    else
-        printf "  %b│%b  • %bHermes Web UI:%b  Disabled (Lightweight mode — toggle via 'aistack')\n" "$C_GREEN" "$C_RESET" "$C_BOLD" "$C_RESET"
-    fi
+    printf "  %b│%b  • %bOpenAI API Base:%b http://localhost:20128/v1 (Key: sk_9router)\n" "$C_GREEN" "$C_RESET" "$C_BOLD" "$C_RESET"
     printf "  %b│%b  • %bManage Stack:%b   Run %baistack%b anytime to open the interactive TUI\n" "$C_GREEN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
     printf "  %b╰──────────────────────────────────────────────────────────────────────╯%b\n" "$C_GREEN" "$C_RESET"
+    client_access_info
 }
 
-# Install 'aistack' and 'hermesstack' CLI shortcut symlinks
+# Install 'aistack' and 'ninestack' CLI shortcut symlinks
 install_shortcut() {
     local bin_dir="/usr/local/bin"
     if [[ "$(id -u)" -ne 0 ]]; then
@@ -2822,13 +2459,14 @@ install_shortcut() {
     fi
     
     ln -sf "$SCRIPT_PATH" "$bin_dir/aistack" 2>/dev/null || true
+    ln -sf "$SCRIPT_PATH" "$bin_dir/ninestack" 2>/dev/null || true
     ln -sf "$SCRIPT_PATH" "$bin_dir/hermesstack" 2>/dev/null || true
     if [[ -L "$bin_dir/aistack" ]]; then
-        success "Installed CLI shortcuts: $bin_dir/aistack & $bin_dir/hermesstack"
+        success "Installed CLI shortcuts: $bin_dir/aistack & $bin_dir/ninestack"
     fi
 }
 
-# Uninstall HermesStack (Standard or Complete Purge)
+# Uninstall NineStack (Standard or Complete Purge)
 stack_uninstall() {
     local purge="false"
     for arg in "$@"; do
@@ -2839,7 +2477,7 @@ stack_uninstall() {
     done
 
     printf "\n  %b╭──────────────────────────────────────────────────────────────────────╮%b\n" "$C_YELLOW" "$C_RESET"
-    printf "  %b│%b  %b🗑️  HERMES STACK UNINSTALLER%b                                         %b│%b\n" "$C_YELLOW" "$C_RESET" "$C_BOLD$C_WHITE" "$C_RESET" "$C_YELLOW" "$C_RESET"
+    printf "  %b│%b  %b🗑️  NINE-STACK UNINSTALLER%b                                           %b│%b\n" "$C_YELLOW" "$C_RESET" "$C_BOLD$C_WHITE" "$C_RESET" "$C_YELLOW" "$C_RESET"
     printf "  %b╰──────────────────────────────────────────────────────────────────────╯%b\n" "$C_YELLOW" "$C_RESET"
 
     if [[ "${ASSUME_YES:-false}" != "true" ]]; then
@@ -2852,7 +2490,7 @@ stack_uninstall() {
             0) purge="false" ;;
             1)
                 purge="true"
-                warn "Complete Purge will permanently delete all 9Router providers, Hermes memory, and SSL certificates!"
+                warn "Complete Purge will permanently delete all 9Router data and SSL certificates!"
                 if ! tui_confirm "Are you 100% sure you want to permanently delete all data?" "n"; then
                     info "Uninstallation canceled."
                     return 0
@@ -2868,7 +2506,7 @@ stack_uninstall() {
     # Collect candidate stack and script directories
     local script_dir
     script_dir="$(dirname "$SCRIPT_PATH")"
-    local candidate_dirs=("$STACK_DIR" "/opt/ai-stack" "/opt/hermes-stack" "${HOME}/ai-stack" "${HOME}/.hermes-stack")
+    local candidate_dirs=("$STACK_DIR" "/opt/nine-stack" "/opt/ai-stack" "/opt/hermes-stack" "${HOME}/nine-stack" "${HOME}/ai-stack" "${HOME}/.hermes-stack")
     # Only include script_dir if it's an installed location (not a git repository checkout)
     if [[ ! -d "$script_dir/.git" ]]; then
         candidate_dirs+=("$script_dir")
@@ -2888,7 +2526,7 @@ stack_uninstall() {
     done
 
     if command -v docker >/dev/null 2>&1; then
-        docker rm -f ai-stack-nine-router ai-stack-hermes ai-stack-caddy ai-stack-xray 2>/dev/null || true
+        docker rm -f ai-stack-nine-router ai-stack-caddy ai-stack-xray ai-stack-hermes 2>/dev/null || true
         if [[ "$purge" == "true" ]]; then
             info "Removing Docker persistent volumes..."
             docker volume rm -f ai-stack_nine_router_data ai-stack_caddy_data ai-stack_caddy_config 2>/dev/null || true
@@ -2897,12 +2535,13 @@ stack_uninstall() {
 
     # 2. Remove automated backup cron jobs
     if command -v crontab >/dev/null 2>&1; then
-        (crontab -l 2>/dev/null | grep -v "backup create" | grep -v "aistack" | grep -v "hermes-stack" || true) | crontab - 2>/dev/null || true
+        (crontab -l 2>/dev/null | grep -v "backup create" | grep -v "aistack" | grep -v "ninestack" | grep -v "hermes-stack" || true) | crontab - 2>/dev/null || true
     fi
 
     # 3. Remove CLI symlinks
-    info "Removing CLI shortcuts (aistack, hermesstack)..."
-    rm -f /usr/local/bin/aistack /usr/local/bin/hermesstack "${HOME}/.local/bin/aistack" "${HOME}/.local/bin/hermesstack" 2>/dev/null || true
+    info "Removing CLI shortcuts (aistack, ninestack, hermesstack)..."
+    rm -f /usr/local/bin/aistack /usr/local/bin/ninestack /usr/local/bin/hermesstack \
+          "${HOME}/.local/bin/aistack" "${HOME}/.local/bin/ninestack" "${HOME}/.local/bin/hermesstack" 2>/dev/null || true
 
     # 4. Purge or preserve directories
     if [[ "$purge" == "true" ]]; then
@@ -2912,10 +2551,10 @@ stack_uninstall() {
                 rm -rf "$d" 2>/dev/null || true
             fi
         done
-        success "HermesStack and all associated data have been completely purged."
+        success "NineStack and all associated data have been completely purged."
     else
         info "Preserved stack data and configurations at: $STACK_DIR"
-        success "HermesStack containers stopped and CLI shortcuts removed."
+        success "NineStack containers stopped and CLI shortcuts removed."
     fi
     exit 0
 }
@@ -2950,23 +2589,20 @@ run_selftest() {
     echo "$ob" | grep -q '"serverName": "cdn.example.com"' || die "Self-test failed: Xray reality SNI"
     success "Self-test 2 (Xray link parser): PASSED"
     
-    # Test 3: Hermes config merger & self-healing of concatenated _config_version
-    cat > "$test_dir/hermes/config.yaml" << 'EOF'
-model:
-  default: old-model
-  provider: custom
-  base_url: http://nine-router:20128/v1
-  api_key: 112111_config_version: 51
-dashboard:
-  public_url: http://localhost:9119
+    # Test 3: Caddyfile generation & 9Router reverse proxy routing
+    cat > "$test_dir/domains.tsv" << 'EOF'
+test.example.com	9router	auto		
 EOF
-    merge_hermes_config "test-model-4b" "secret-key-123" "ai.test.domain"
-    local cfg_content
-    cfg_content=$(cat "$test_dir/hermes/config.yaml")
-    echo "$cfg_content" | grep -q 'default: "test-model-4b"' || die "Self-test failed: Hermes model merge"
-    echo "$cfg_content" | grep -q 'https://ai.test.domain' || die "Self-test failed: Hermes dashboard merge"
-    echo "$cfg_content" | grep -q '^_config_version: 51$' || die "Self-test failed: Hermes _config_version preservation/healing"
-    success "Self-test 3 (Hermes config.yaml merge & self-healing): PASSED"
+    generate_caddyfile
+    grep -q 'test.example.com {' "$test_dir/Caddyfile" || die "Self-test failed: Caddyfile missing domain block"
+    grep -q 'reverse_proxy nine-router:20128' "$test_dir/Caddyfile" || die "Self-test failed: Caddyfile proxy target"
+    success "Self-test 3 (Caddyfile generation): PASSED"
+
+    # Test 4: Compose file generation (no hermes container)
+    generate_docker_compose
+    grep -q 'container_name: ai-stack-nine-router' "$test_dir/docker-compose.yml" || die "Self-test failed: 9Router service missing"
+    grep -q 'container_name: ai-stack-hermes' "$test_dir/docker-compose.yml" && die "Self-test failed: Hermes container unexpectedly present"
+    success "Self-test 4 (Compose generation without Hermes container): PASSED"
     
     # Cleanup
     STACK_DIR="$prev_stack"
@@ -3041,33 +2677,22 @@ tui_menu_proxy() {
 tui_menu_features() {
     local dirty=0
     while true; do
-        local d_en
-        d_en=$(env_get "HERMES_DASHBOARD_ENABLED" "true")
-        local a_en
-        a_en=$(env_get "HERMES_API_ENABLED" "true")
         local c_en
         c_en=$(env_get "CADDY_ENABLED" "auto")
         local m_cap
         m_cap=$(env_get "NINE_ROUTER_MAX_MEM" "256")
+        local req_key
+        req_key=$(env_get "REQUIRE_API_KEY" "false")
 
-        tui_select "🪶 Lightweight Mode & Resource Tuning (Press Enter to toggle)" \
-            "Hermes Web UI (:9119)   : $([[ "$d_en" == "true" ]] && echo "ON  → Press to Disable (Saves ~80MB RAM)" || echo "OFF → Press to Enable Web Dashboard")" \
-            "Hermes API (:8642)      : $([[ "$a_en" == "true" ]] && echo "ON  → Press to Disable HTTP API" || echo "OFF → Press to Enable OpenAI API Endpoint")" \
-            "Caddy Reverse Proxy     : [${c_en}] → Press to cycle (auto = only runs when domains exist)" \
-            "9Router V8 Heap Cap     : ${m_cap} MB → Press to change (192MB / 256MB / 512MB / Custom)" \
+        tui_select "🪶 Tuning, Caddy & Auth Settings (Press Enter to toggle)" \
+            "Caddy Reverse Proxy : [${c_en}] → Press to cycle (auto = only runs when domains exist)" \
+            "9Router V8 Heap Cap : ${m_cap} MB → Press to change (192MB / 256MB / 512MB / Custom)" \
+            "API Key Enforcement : $([[ "$req_key" == "true" ]] && echo "ON  → Strict keys only (Press to allow sk_9router)" || echo "OFF → Permissive sk_9router (Press to enforce keys)")" \
             "✅ Apply Changes & Restart Stack Now" \
             "🔙 Back to Main Menu" || break
 
         case "$TUI_CHOICE" in
             0)
-                [[ "$d_en" == "true" ]] && features_set dashboard off || features_set dashboard on
-                dirty=1
-                ;;
-            1)
-                [[ "$a_en" == "true" ]] && features_set api off || features_set api on
-                dirty=1
-                ;;
-            2)
                 case "$c_en" in
                     auto)  features_set caddy on ;;
                     true)  features_set caddy off ;;
@@ -3075,7 +2700,7 @@ tui_menu_features() {
                 esac
                 dirty=1
                 ;;
-            3)
+            1)
                 tui_select "Select 9Router V8 Max Memory Limit" \
                     "192 MB — Ultra-Light (For 1GB–2GB RAM VPS)" \
                     "256 MB — Balanced Default (Recommended)" \
@@ -3093,11 +2718,15 @@ tui_menu_features() {
                 esac
                 dirty=1
                 ;;
-            4)
+            2)
+                [[ "$req_key" == "true" ]] && features_set require-key off || features_set require-key on
+                dirty=1
+                ;;
+            3)
                 stack_restart
                 dirty=0
                 ;;
-            5)
+            4)
                 if (( dirty == 1 )); then
                     if tui_confirm "Apply feature changes and restart stack now?" "y"; then
                         stack_restart
@@ -3216,57 +2845,53 @@ tui_menu_logs() {
     tui_select "Select Service Logs to Stream (Press Ctrl+C to stop streaming)" \
         "All Services" \
         "9Router (AI Gateway)" \
-        "Hermes Agent" \
         "Caddy Reverse Proxy" \
         "Xray Proxy Balancer" \
         "Back to Main Menu" || return 0
     case "$TUI_CHOICE" in
         0) stack_logs "" || true ;;
         1) stack_logs "nine-router" || true ;;
-        2) stack_logs "hermes" || true ;;
-        3) stack_logs "caddy" || true ;;
-        4) stack_logs "xray" || true ;;
-        5) return 0 ;;
+        2) stack_logs "caddy" || true ;;
+        3) stack_logs "xray" || true ;;
+        4) return 0 ;;
     esac
 }
 
-tui_menu_hermes() {
+tui_menu_clients() {
     while true; do
-        merge_hermes_config >/dev/null 2>&1 || true
-        local cur_m
-        cur_m=$(env_get "DEFAULT_MODEL" "nousresearch/hermes-3-llama-3.1-8b")
-        local dash_en
-        dash_en=$(env_get "HERMES_DASHBOARD_ENABLED" "true")
+        local rpass
+        rpass=$(env_get "INITIAL_PASSWORD" "123456")
+        local req_key
+        req_key=$(env_get "REQUIRE_API_KEY" "false")
 
-        tui_select "🤖 Hermes Agent Console & Configuration (Model: $cur_m)" \
-            "💬 Launch Interactive Agent Chat in Terminal (hermes chat)" \
-            "🖥️  Launch Fullscreen Agent TUI (hermes --tui)" \
-            "⚙️  Run Hermes Interactive Setup Wizard (Telegram, Discord, Slack, Tools)" \
-            "🧠 Change Default AI Model (Currently: $cur_m)" \
-            "📝 Edit Hermes config.yaml Directly & Validate" \
-            "🔧 Repair / Validate Hermes config.yaml Now" \
-            "🌐 View Web UI, API & SSH Port-Forwarding Access Guide (WebUI: $([[ "$dash_en" == "true" ]] && echo "ON" || echo "OFF"))" \
-            "🐚 Open Interactive Shell Inside Hermes Container" \
+        tui_select "🔌 Connect External AI Clients (Hermes, Cursor, Cline, Claude Code)" \
+            "📖 View Comprehensive Client Setup Guide & cURL Examples" \
+            "🔑 Change 9Router Initial Admin Password (Current: $rpass)" \
+            "🛡️  Toggle API Key Enforcement (Currently: $([[ "$req_key" == "true" ]] && echo "Enforced" || echo "Permissive - sk_9router"))" \
+            "💻 Show Host Shell Proxy Export Commands (HTTP_PROXY / ALL_PROXY)" \
             "Back to Main Menu" || break
 
         case "$TUI_CHOICE" in
-            0) hermes_exec hermes chat || true ;;
-            1) hermes_exec hermes --tui || true ;;
-            2) hermes_exec hermes setup || true; merge_hermes_config >/dev/null 2>&1 || true ;;
-            3)
-                local new_m=""
-                tui_input "Enter Default AI Model name (e.g. gpt-4o, claude-3-5-sonnet, nousresearch/hermes-3-llama-3.1-8b)" "$cur_m" new_m
-                if [[ -n "$new_m" ]]; then
-                    env_set "DEFAULT_MODEL" "$new_m"
-                    merge_hermes_config "$new_m" "$(env_get "INITIAL_PASSWORD" "123456")" ""
-                    success "Default model updated to: $new_m"
+            0) client_access_info; tui_pause ;;
+            1)
+                local new_pass=""
+                tui_input "Enter new 9Router admin password" "$rpass" new_pass
+                if [[ -n "$new_pass" ]]; then
+                    env_set "INITIAL_PASSWORD" "$new_pass"
+                    generate_docker_compose
+                    success "9Router password updated. Restart stack to apply."
                 fi
                 ;;
-            4) hermes_edit_config || true; tui_pause ;;
-            5) hermes_fix_config || true; tui_pause ;;
-            6) hermes_access_info; tui_pause ;;
-            7) hermes_exec bash || true ;;
-            8) break ;;
+            2)
+                [[ "$req_key" == "true" ]] && features_set require-key off || features_set require-key on
+                tui_pause
+                ;;
+            3)
+                printf "\n"
+                proxy_env || true
+                tui_pause
+                ;;
+            4) break ;;
         esac
     done
 }
@@ -3276,23 +2901,23 @@ interactive_menu() {
     while true; do
         tui_header
         TUI_DEFAULT_INDEX="$last_choice" tui_select "Main Menu (Keys 1-9 instant select)" \
-            "🤖 Hermes Agent Console   — Chat, TUI, Bot Setup, Model & Config Editor" \
-            "🌐 Domain & SSL Manager   — Expose Services via Auto-TLS or Cloudflare/Arvan CDN" \
-            "🛡️ Proxy & Xray Routing   — VLESS/VMess/Trojan/SS Balancer & Host Proxy" \
-            "🪶 Lightweight & Features — Toggle Hermes Web UI, API, Caddy & Memory Cap" \
-            "📊 Status & Access Guide  — Container Health, Ports, Passwords & SSH Tunnel" \
-            "⚡ Lifecycle & Doctor     — Start, Stop, Restart Services & Run Network Doctor" \
-            "🧰 Maintenance & Backups  — Backups, Iran Mirrors/MTU, Image Updates & Logs" \
-            "🗑️  Uninstall HermesStack  — Stop Stack & Remove CLI (Keep or Purge Data)" \
+            "🔌 Connect AI Clients    — Guides & Configs for Hermes, Cursor, Cline, Claude Code" \
+            "🌐 Domain & SSL Manager  — Expose 9Router via Auto-TLS or Cloudflare/Arvan CDN" \
+            "🛡️ Proxy & Xray Routing  — VLESS/VMess/Trojan/SS Balancer & Host Proxy" \
+            "🪶 Tuning & Features     — Caddy Mode, 9Router V8 Heap Cap, API Key Auth" \
+            "📊 Status & Diagnostics — Container Health, Ports, Passwords & System Doctor" \
+            "⚡ Lifecycle & Logs      — Start, Stop, Restart Services & Stream Logs" \
+            "🧰 Maintenance & Backups — Backups, Iran Mirrors/MTU, Image Updates & Offline Bundles" \
+            "🗑️  Uninstall Stack       — Stop Stack & Remove CLI (Keep or Purge Data)" \
             "🚪 Exit" || break
 
         last_choice=$TUI_CHOICE
         case "$TUI_CHOICE" in
-            0) tui_menu_hermes ;;
+            0) tui_menu_clients ;;
             1) tui_menu_domains ;;
             2) tui_menu_proxy ;;
             3) tui_menu_features ;;
-            4) stack_status; hermes_access_info; tui_pause ;;
+            4) stack_status; client_access_info; tui_pause ;;
             5)
                 tui_select "⚡ Service Lifecycle & Diagnostics" \
                     "🔄 Start / Restart All Stack Services" \
@@ -3321,7 +2946,7 @@ interactive_menu() {
 show_help() {
     cat << EOF
 AI Stack Manager v${VERSION}
-Manage 9Router, Hermes Agent, Caddy reverse proxy, and Xray anti-censorship.
+Manage 9Router (LLM Gateway), Caddy (Domains & Auto-TLS), and Xray (Anti-Censorship).
 
 Usage:
   $SCRIPT_NAME [flags] [subcommand] [arguments...]
@@ -3344,16 +2969,9 @@ Subcommands:
   update                Pull latest images with auto-backup and health verification
   rollback              Rollback to previous image digests if update failed
 
-Hermes Agent Commands:
-  hermes chat           Launch interactive Hermes Agent chat in terminal
-  hermes tui            Launch fullscreen Hermes Agent TUI
-  hermes setup          Run Hermes setup wizard (Telegram, Discord, Slack, tools, providers)
-  hermes model [name]   View or set the default AI model
-  hermes config edit    Edit Hermes config.yaml in $EDITOR and validate
-  hermes fix-config     Repair and validate Hermes config.yaml
-  hermes access         Show Web UI, API, and SSH port-forwarding instructions
-  hermes shell          Open a bash shell inside the Hermes container
-  hermes <args...>      Pass any command directly to 'hermes' CLI inside container
+AI Clients & Access:
+  clients / access      Show manual client configs (Hermes Agent, Cursor, Cline, cURL)
+  hermes [args...]      Show client setup instructions for Hermes Agent
 
 Domain Commands:
   domain list           List configured domains and their CDN status
@@ -3370,12 +2988,11 @@ Proxy Commands:
   proxy env             Output exportable HTTP_PROXY/ALL_PROXY env vars for host shell
   proxy exec <cmd...>   Run a host command routed through the active stack proxy
 
-Feature & Lightweight Mode Commands:
-  features status                Show optional features and memory caps
-  features dashboard <on|off>    Toggle Hermes Web UI (Port 9119)
-  features api <on|off>          Toggle Hermes API server (Port 8642)
+Feature & Resource Tuning:
+  features status                Show Caddy mode, memory cap, and auth settings
   features caddy <auto|on|off>   Set Caddy mode (auto = only runs when domains exist)
   features memory <MB>           Set 9Router V8 max memory limit in MB (default: 256)
+  features require-key <on|off>  Toggle strict API key enforcement
 
 Backup Commands:
   backup create [tag]   Create full consistent backup archive (SQLite + SSL + Config)
@@ -3391,8 +3008,8 @@ Iran Utilities:
   bundle import <file>  Import container images from offline tarball
 
 Other:
-  uninstall [--purge]   Uninstall HermesStack (optionally purge all data & volumes)
-  shortcut              Install 'aistack' & 'hermesstack' CLI shortcuts
+  uninstall [--purge]   Uninstall NineStack (optionally purge all data & volumes)
+  shortcut              Install 'aistack' & 'ninestack' CLI shortcuts
   selftest              Run internal unit tests
 EOF
 }
@@ -3510,15 +3127,15 @@ case "$CMD" in
         shift || true
         case "$sub" in
             status) features_status ;;
-            dashboard|api|caddy|memory) features_set "$sub" "${1:-}" ;;
+            caddy|memory|auth|require-key|require_key) features_set "$sub" "${1:-}" ;;
             *) die "Unknown features subcommand: $sub" ;;
         esac
         ;;
-    hermes|agent)
-        hermes_cli "$@"
+    clients|access)
+        client_access_info
         ;;
-    chat)
-        hermes_cli chat "$@"
+    hermes|agent|chat)
+        hermes_cli "$@"
         ;;
     backup)
         sub="${1:-create}"

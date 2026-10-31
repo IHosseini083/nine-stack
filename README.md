@@ -1,12 +1,14 @@
-# HermesStack
+# NineStack
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Docker](https://img.shields.io/badge/Docker-20.10+-blue.svg)](https://www.docker.com/)
 [![Caddy](https://img.shields.io/badge/Caddy-2.x-00ACD7.svg)](https://caddyserver.com/)
 [![9Router](https://img.shields.io/badge/9Router-Gateway-6366f1.svg)](https://github.com/decolua/9router)
-[![Hermes Agent](https://img.shields.io/badge/Hermes-Agent-black.svg)](https://nousresearch.com/)
+[![Xray](https://img.shields.io/badge/Xray-Core-red.svg)](https://github.com/XTLS/Xray-core)
 
-A production-ready, self-hosted AI deployment stack combining **9Router** (LLM routing & proxy), **Hermes Agent** (autonomous agent supervisor & dashboard), **Caddy 2** (reverse proxy with auto-TLS and CDN Origin support), and an optional **Xray Core balancer** for high resilience under restricted internet conditions (e.g. Iranian VPSs).
+A production-ready, self-hosted AI deployment stack combining **9Router** (LLM routing & model gateway), **Caddy 2** (reverse proxy with auto-TLS and CDN Origin support), and an optional **Xray Core balancer** for high resilience under restricted internet conditions (e.g. Iranian VPSs).
+
+External clients—including **Hermes Agent**, **Cursor**, **Cline**, **Roo Code**, and **Claude Code**—connect directly to 9Router's OpenAI-compatible endpoint.
 
 ---
 
@@ -14,15 +16,18 @@ A production-ready, self-hosted AI deployment stack combining **9Router** (LLM r
 
 - [Architecture](#architecture)
 - [Quickstart](#quickstart)
+- [Connecting External AI Clients](#connecting-external-ai-clients)
+  - [Hermes Agent](#hermes-agent-manual-setup)
+  - [Cursor / Cline / Roo / Claude Code](#cursor--cline--roo--claude-code)
+  - [cURL Example](#curl-test)
 - [Command Reference](#command-reference)
-  - [Lifecycle & Status](#lifecycle--status)
-  - [Optional Features & Lightweight Mode](#optional-features--lightweight-mode)
+  - [Lifecycle & Diagnostics](#lifecycle--diagnostics)
+  - [Resource Tuning & Auth](#resource-tuning--auth)
   - [Domain Management](#domain-management)
   - [Proxy & Censorship Circumvention](#proxy--censorship-circumvention)
   - [Backups & Rollback](#backups--rollback)
   - [Iran VPS Utilities](#iran-vps-utilities)
 - [Multiple Domains & CDN Integration](#multiple-domains--cdn-integration)
-- [Safe Configuration & Extensibility](#safe-configuration--extensibility)
 - [Documentation](#documentation)
 - [One-Liner Uninstallation](#one-liner-uninstallation)
 - [Testing](#testing)
@@ -33,32 +38,27 @@ A production-ready, self-hosted AI deployment stack combining **9Router** (LLM r
 ## Architecture
 
 ```
-                      Internet / Clients
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │  Caddy Gateway  │  (Ports 80/443, Auto-TLS / CDN Origin)
-                    └────────┬────────┘
-                             │
-              ┌──────────────┴──────────────┐
-              │                             │
-              ▼                             ▼
-     ┌─────────────────┐           ┌─────────────────┐
-     │     9Router     │           │   Hermes Agent  │
-     │  (Port 20128)   │           │  (Port 9119)    │
-     │  Model Gateway  │           │  Autonomous AI  │
-     └────────┬────────┘           └────────┬────────┘
-              │                             │
-              └──────────────┬──────────────┘
-                             │
-                             ▼ (Outbound AI API Requests)
-                    ┌─────────────────┐
-                    │  Proxy / Xray   │  (SOCKS5 10808 / HTTP 10809)
-                    │  Core Balancer  │  (leastPing, geosite/geoip:ir direct)
-                    └────────┬────────┘
-                             │
-                             ▼
-              External AI APIs (OpenAI, Anthropic, OpenRouter)
+             AI Clients (Hermes Agent, Cursor, Cline, Claude Code)
+                               │
+                               ▼
+                      ┌─────────────────┐
+                      │  Caddy Gateway  │  (Ports 80/443, Auto-TLS / CDN Origin)
+                      └────────┬────────┘
+                               │
+                               ▼
+                      ┌─────────────────┐
+                      │     9Router     │  (Port 20128)
+                      │  LLM Gateway    │  (Admin UI + /v1 OpenAI API)
+                      └────────┬────────┘
+                               │
+                               ▼ (Outbound AI API Requests)
+                      ┌─────────────────┐
+                      │  Proxy / Xray   │  (SOCKS5 10808 / HTTP 10809)
+                      │  Core Balancer  │  (leastPing, geosite/geoip:ir direct)
+                      └────────┬────────┘
+                               │
+                               ▼
+        External AI APIs (OpenAI, Anthropic, OpenRouter, DeepSeek)
 ```
 
 Detailed architecture specifications are available in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -69,21 +69,60 @@ Detailed architecture specifications are available in [docs/ARCHITECTURE.md](doc
 
 ### One-Liner Installation
 
-Install HermesStack and create the `aistack` system shortcut:
+Install NineStack and create the `aistack` / `ninestack` system shortcuts:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/IHosseini083/HermesStack/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/IHosseini083/nine-stack/main/install.sh | bash
 ```
 
-The installer verifies prerequisites, downloads `manage.sh`, installs the `aistack` CLI tool, and launches the interactive setup wizard.
+The installer verifies prerequisites, downloads `manage.sh`, installs the `aistack` and `ninestack` CLI tools, and launches the interactive setup wizard.
+
+---
+
+## Connecting External AI Clients
+
+9Router exposes an OpenAI-compatible API endpoint at:
+- **Local / SSH Tunnel**: `http://127.0.0.1:20128/v1`
+- **With Custom Domain**: `https://<your-domain>/v1`
+- **Default API Key**: `sk_9router` (or custom keys created in 9Router Admin UI)
+
+### Hermes Agent (Manual Setup)
+
+Run Hermes Agent natively on your host machine or laptop connected to 9Router:
+
+```bash
+# 1. Point Hermes to 9Router
+hermes config set model.provider custom
+hermes config set model.base_url "http://127.0.0.1:20128/v1"
+hermes config set model.api_key "sk_9router"
+hermes config set model.default "gpt-4o"  # Or your configured model
+
+# 2. Start chatting with Hermes
+hermes chat
+```
+
+### Cursor / Cline / Roo / Claude Code
+
+Configure your editor or coding agent with:
+- **Provider**: OpenAI Compatible
+- **Base URL**: `http://127.0.0.1:20128/v1` (or `https://<your-domain>/v1`)
+- **API Key**: `sk_9router`
+- **Model Name**: Enter any model configured in your 9Router dashboard
+
+### cURL Test
+
+```bash
+curl -s http://127.0.0.1:20128/v1/models \
+  -H "Authorization: Bearer sk_9router"
+```
 
 ---
 
 ## Command Reference
 
-HermesStack can be managed interactively by running `aistack`, or non-interactively using CLI subcommands:
+Manage NineStack interactively by running `aistack` or `ninestack`, or non-interactively using CLI subcommands:
 
-### Lifecycle & Status
+### Lifecycle & Diagnostics
 | Command | Description |
 | :--- | :--- |
 | `aistack setup` | Launch interactive configuration wizard |
@@ -91,39 +130,27 @@ HermesStack can be managed interactively by running `aistack`, or non-interactiv
 | `aistack start` | Start all services |
 | `aistack stop` | Stop all services |
 | `aistack restart` | Restart all services |
-| `aistack logs [service]` | Stream live container logs (`nine-router`, `hermes`, `caddy`, `xray`) |
+| `aistack logs [service]` | Stream live container logs (`nine-router`, `caddy`, `xray`) |
 | `aistack doctor` | Run comprehensive system, RAM, DNS poisoning, and API diagnostics |
 | `aistack update` | Pull latest images with auto-backup and healthcheck verification |
 | `aistack rollback` | Revert to previous container image digests if update failed |
+| `aistack clients` | Display client connection instructions, endpoints, and credentials |
 
-### Optional Features & Lightweight Mode
+### Resource Tuning & Auth
 | Command | Description |
 | :--- | :--- |
-| `aistack features status` | Show optional features (`dashboard`, `api`, `caddy`) and memory caps |
-| `aistack features dashboard <on\|off>` | Enable or disable Hermes Web UI on port 9119 to save RAM |
-| `aistack features api <on\|off>` | Enable or disable Hermes HTTP API server on port 8642 |
+| `aistack features status` | Show Caddy mode, 9Router heap cap, and API key enforcement |
 | `aistack features caddy <auto\|on\|off>` | Control Caddy container (`auto` only starts Caddy when domains exist) |
-| `aistack features memory <MB>` | Set 9Router Node.js V8 heap limit in MB (default: `256`) |
+| `aistack features memory <MB>` | Set 9Router Node.js V8 heap limit in MB (default: `256`, min: `128`) |
+| `aistack features require-key <on\|off>` | Toggle strict API key enforcement vs permissive (`sk_9router`) |
 
 ### Domain Management
 | Command | Description |
 | :--- | :--- |
 | `aistack domain list` | List active domains and detected CDN providers |
-| `aistack domain add` | Add a domain (interactive or CLI flags: `domain add <domain> <service> <tls_mode>`) |
+| `aistack domain add [dom] [tls]` | Add a domain (interactive or CLI flags: `domain add <domain> <tls_mode>`) |
 | `aistack domain rm <domain>` | Remove domain and reload Caddy with zero downtime |
 | `aistack domain sync` | Regenerate `Caddyfile` and reload Caddy |
-
-### Hermes Agent Console & Configuration
-| Command | Description |
-| :--- | :--- |
-| `aistack hermes chat` | Launch interactive Hermes Agent chat directly in your terminal |
-| `aistack hermes tui` | Launch the fullscreen Hermes Agent TUI |
-| `aistack hermes setup` | Run Hermes interactive setup wizard (Telegram, Discord, Slack, tools, skills) |
-| `aistack hermes model [name]` | View or update the default AI model |
-| `aistack hermes config edit` | Edit `hermes/config.yaml` in `$EDITOR` and validate syntax |
-| `aistack hermes fix-config` | Auto-repair and validate `hermes/config.yaml` |
-| `aistack hermes access` | Show Web UI, OpenAI API, and SSH port-forwarding instructions |
-| `aistack hermes <args...>` | Run any native `hermes` CLI command inside the agent container |
 
 ### Proxy & Censorship Circumvention
 | Command | Description |
@@ -159,21 +186,11 @@ See [docs/IRAN_VPS_GUIDE.md](docs/IRAN_VPS_GUIDE.md) and [docs/PROXY_AND_XRAY.md
 
 ## Multiple Domains & CDN Integration
 
-HermesStack supports routing traffic through Cloudflare or ArvanCloud CDNs as well as direct DNS:
+NineStack routes all domains directly to 9Router, serving both the Web Admin UI (`/admin`) and the OpenAI API (`/v1/*`):
 
 - **Auto Mode (`auto`)**: Issues Let's Encrypt certificates with ZeroSSL fallback. Ideal for direct DNS pointing to the VPS.
 - **Origin Mode (`origin`)**: Allows pasting Cloudflare or ArvanCloud Origin Certificates. Enables "Full (Strict)" SSL without ACME challenge failures.
 - **Internal Mode (`internal`)**: Enables Caddy internal self-signed certificates for local setups and Tailscale networks.
-
----
-
-## Safe Configuration & Extensibility
-
-- **Non-Destructive Hermes Config Merging**: Editing model keys or public URLs only touches the `model:` and `dashboard:` blocks of `hermes/config.yaml`. Custom tools, skills, and memory databases are never overwritten.
-- **User Overrides**:
-  - `Caddyfile.d/custom`: Place custom Caddy route blocks here.
-  - `docker-compose.override.yml`: Place additional Docker Compose services or volume mounts here.
-- **Safe Secrets**: All JWT, API, and salt keys are generated using `openssl rand -hex` and persisted with strict permissions (`chmod 600 .env`).
 
 ---
 
@@ -189,10 +206,10 @@ Full guides and technical specifications are available in the [docs/](docs/READM
 
 ## One-Liner Uninstallation
 
-To remove HermesStack:
+To remove NineStack:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/IHosseini083/HermesStack/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/IHosseini083/nine-stack/main/uninstall.sh | bash
 ```
 
 Options:

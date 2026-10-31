@@ -58,46 +58,37 @@ assert 'geoip:private' not in cfg['routing']['rules'][1]['ip']
 "
 echo "  Xray configuration, DNS poisoning protection, and observatory verified."
 
-# 4. Test Hermes config.yaml preservation & self-healing
-echo "[4/7] Testing Hermes config.yaml merge & self-healing logic..."
-mkdir -p "$TEST_TEMP/hermes"
-cat > "$TEST_TEMP/hermes/config.yaml" << 'EOF'
-system:
-  custom_setting: true
-  temperature: 0.7
-model:
-  default: old-model
-  provider: custom
-  base_url: http://nine-router:20128/v1
-  api_key: 112111_config_version: 51
-dashboard:
-  public_url: http://old
-EOF
+# 4. Test Client Access Info & Compatibility Commands
+echo "[4/7] Testing client access info & CLI compatibility..."
+ACCESS_OUT=$("$STACK_SCRIPT" --dir "$TEST_TEMP" clients)
+echo "$ACCESS_OUT" | grep -q '9ROUTER CLIENT SETUP & API ACCESS GUIDE' || {
+    echo "Client access guide output missing expected header"
+    exit 1
+}
+echo "$ACCESS_OUT" | grep -q 'http://127.0.0.1:20128/v1' || {
+    echo "API base URL missing in access guide"
+    exit 1
+}
+echo "$ACCESS_OUT" | grep -q 'hermes config set' || {
+    echo "Hermes setup instructions missing in access guide"
+    exit 1
+}
 
-"$STACK_SCRIPT" --dir "$TEST_TEMP" hermes fix-config >/dev/null
-"$STACK_SCRIPT" --dir "$TEST_TEMP" hermes model "claude-3-5-sonnet" >/dev/null
-
-python3 -c "
-cfg_file = '$TEST_TEMP/hermes/config.yaml'
-with open(cfg_file, 'r') as f:
-    c = f.read()
-assert 'custom_setting: true' in c, 'Custom setting was lost'
-assert 'default: \"claude-3-5-sonnet\"' in c, 'Updated model not found'
-assert '\n_config_version: 51\n' in c, '_config_version: 51 was not healed onto its own line'
-assert 'api_key: 112111_config_version' not in c, 'Corrupted line still present'
-for line in c.splitlines():
-    assert line.count(': ') <= 1 or line.strip().startswith('#') or '\"http' in line, f'Invalid YAML mapping on line: {line}'
-"
-echo "  Hermes config.yaml merge & self-healing verified."
+HERMES_CMD_OUT=$("$STACK_SCRIPT" --dir "$TEST_TEMP" hermes chat 2>&1)
+echo "$HERMES_CMD_OUT" | grep -q 'Hermes Agent runs manually/externally' || {
+    echo "Compatibility wrapper did not notify external run status"
+    exit 1
+}
+echo "  Client access guide and compatibility wrapper verified."
 
 STACK_DIR="$TEST_TEMP" "$STACK_SCRIPT" --dir "$TEST_TEMP" status >/dev/null 2>&1 || true
 
-# 5. Test Caddyfile generation
-echo "[5/6] Testing Caddyfile generation..."
+# 5. Test Caddyfile generation (all domains proxy directly to 9Router)
+echo "[5/7] Testing Caddyfile generation & 9Router domain routing..."
 cat > "$TEST_TEMP/domains.tsv" << 'EOF'
 router.example.com	9router	auto		
-agent.example.com	hermes	origin	/cert.pem	/key.pem
-both.example.com	both	internal		
+cdn.example.com	9router	origin	/cert.pem	/key.pem
+internal.example.com	9router	internal		
 EOF
 
 # Trigger sync
@@ -107,22 +98,21 @@ python3 -c "
 with open('$TEST_TEMP/Caddyfile', 'r') as f:
     c = f.read()
 assert 'router.example.com {' in c
+assert 'cdn.example.com {' in c
+assert 'internal.example.com {' in c
 assert 'reverse_proxy nine-router:20128' in c
-assert 'agent.example.com {' in c
-assert 'reverse_proxy hermes:9119' in c
-assert 'both.example.com {' in c
-assert 'handle /v1/* {' in c
 assert 'tls internal' in c
+assert 'tls /etc/caddy/certs/cdn.example.com/cert.pem' in c
+assert 'hermes:9119' not in c, 'Hermes container should not be targeted in Caddyfile'
 "
-echo "  Caddyfile structure verified."
+echo "  Caddyfile structure & domain routing verified."
 
 # 6. Test Lightweight Features & Outbound Proxy Compose Generation
-echo "[6/7] Testing lightweight optional features & outbound proxy routing..."
+echo "[6/7] Testing features, compose generation, and proxy routing..."
 rm -f "$TEST_TEMP/domains.tsv"
-"$STACK_SCRIPT" --dir "$TEST_TEMP" features dashboard off >/dev/null
-"$STACK_SCRIPT" --dir "$TEST_TEMP" features api off >/dev/null
 "$STACK_SCRIPT" --dir "$TEST_TEMP" features caddy auto >/dev/null
 "$STACK_SCRIPT" --dir "$TEST_TEMP" features memory 192 >/dev/null
+"$STACK_SCRIPT" --dir "$TEST_TEMP" features require-key on >/dev/null
 
 # Trigger compose generation via proxy enable
 "$STACK_SCRIPT" --dir "$TEST_TEMP" proxy enable >/dev/null 2>&1 || true
@@ -130,18 +120,25 @@ rm -f "$TEST_TEMP/domains.tsv"
 python3 -c "
 with open('$TEST_TEMP/docker-compose.yml', 'r') as f:
     dc = f.read()
-assert 'HERMES_DASHBOARD=0' in dc, 'Dashboard should be disabled'
-assert 'API_SERVER_ENABLED=false' in dc, 'API server should be disabled'
-assert '127.0.0.1:9119:9119' not in dc, 'Port 9119 should not be mapped when dashboard is off'
+assert 'ai-stack-nine-router' in dc, '9Router container should be defined'
+assert 'ai-stack-hermes' not in dc, 'Hermes container must not be present in compose'
 assert 'ai-stack-caddy' not in dc, 'Caddy should be omitted in auto mode when no domains exist'
 assert '--max-old-space-size=192' in dc, '9Router memory cap should be 192MB'
+assert 'REQUIRE_API_KEY=true' in dc, 'API key enforcement should be true'
 assert 'ALL_PROXY=socks5h://xray:10808' in dc, 'Container ALL_PROXY should use socks5h://xray:10808'
 assert 'NODE_USE_ENV_PROXY=1' in dc, 'Node env proxy flag should be set'
 assert '127.0.0.1:10808:10808' in dc, 'Xray SOCKS5 should be exposed to localhost for host outbound traffic'
+assert '127.0.0.1:20128:20128' in dc, '9Router port 20128 should be exposed'
+assert '9119' not in dc, 'Port 9119 should not exist in compose'
+assert '8642' not in dc, 'Port 8642 should not exist in compose'
 "
 
 # Verify host proxy env & exec
 ENV_OUT=$("$STACK_SCRIPT" --dir "$TEST_TEMP" proxy env)
+echo "$ENV_OUT" | grep -q 'HTTP_PROXY="http://127.0.0.1:10809"'
+EXEC_OUT=$("$STACK_SCRIPT" --dir "$TEST_TEMP" proxy exec env)
+echo "$EXEC_OUT" | grep -q 'ALL_PROXY=socks5h://127.0.0.1:10808'
+echo "  Features, compose file, and host/container outbound proxy verified."
 echo "$ENV_OUT" | grep -q 'HTTP_PROXY="http://127.0.0.1:10809"'
 EXEC_OUT=$("$STACK_SCRIPT" --dir "$TEST_TEMP" proxy exec env)
 echo "$EXEC_OUT" | grep -q 'ALL_PROXY=socks5h://127.0.0.1:10808'

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# HermesStack One-Liner Uninstaller
+# NineStack One-Liner Uninstaller
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/IHosseini083/HermesStack/main/uninstall.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/IHosseini083/HermesStack/main/uninstall.sh | bash -s -- --purge -y
+#   curl -fsSL https://raw.githubusercontent.com/IHosseini083/nine-stack/main/uninstall.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/IHosseini083/nine-stack/main/uninstall.sh | bash -s -- --purge -y
 # ==============================================================================
 set -Eeuo pipefail
 
@@ -50,10 +50,10 @@ done
 
 printf "\n"
 printf "  %b╭──────────────────────────────────────────────────────────────────────╮%b\n" "$C_YELLOW" "$C_RESET"
-printf "  %b│%b  %b🗑️  HERMES STACK UNINSTALLER%b                                         %b│%b\n" "$C_YELLOW" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_YELLOW" "$C_RESET"
+printf "  %b│%b  %b🗑️  NINE-STACK UNINSTALLER%b                                           %b│%b\n" "$C_YELLOW" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_YELLOW" "$C_RESET"
 printf "  %b╰──────────────────────────────────────────────────────────────────────╯%b\n\n" "$C_YELLOW" "$C_RESET"
 
-TARGET_DIRS=("/opt/ai-stack" "/opt/hermes-stack" "${HOME}/ai-stack" "${HOME}/.hermes-stack")
+TARGET_DIRS=("/opt/nine-stack" "/opt/ai-stack" "/opt/hermes-stack" "${HOME}/nine-stack" "${HOME}/ai-stack" "${HOME}/.hermes-stack")
 STACK_DIRS=()
 for d in "${TARGET_DIRS[@]}"; do
     [[ -d "$d" ]] && STACK_DIRS+=("$d")
@@ -93,7 +93,7 @@ for d in "${STACK_DIRS[@]}"; do
 done
 
 if command -v docker >/dev/null 2>&1; then
-    docker rm -f ai-stack-nine-router ai-stack-hermes ai-stack-caddy ai-stack-xray 2>/dev/null || true
+    docker rm -f ai-stack-nine-router ai-stack-caddy ai-stack-xray ai-stack-hermes 2>/dev/null || true
     if [[ "$PURGE" == "true" ]]; then
         info "Removing Docker persistent volumes..."
         docker volume rm -f ai-stack_nine_router_data ai-stack_caddy_data ai-stack_caddy_config 2>/dev/null || true
@@ -102,9 +102,9 @@ fi
 
 # 2. Remove cron jobs & symlinks
 if command -v crontab >/dev/null 2>&1; then
-    (crontab -l 2>/dev/null | grep -v "backup create" | grep -v "aistack" | grep -v "hermes-stack" || true) | crontab - 2>/dev/null || true
+    (crontab -l 2>/dev/null | grep -v "backup create" | grep -v "aistack" | grep -v "ninestack" | grep -v "hermes-stack" || true) | crontab - 2>/dev/null || true
 fi
-rm -f /usr/local/bin/aistack /usr/local/bin/hermesstack "${HOME}/.local/bin/aistack" "${HOME}/.local/bin/hermesstack" 2>/dev/null || true
+rm -f /usr/local/bin/aistack /usr/local/bin/ninestack /usr/local/bin/hermesstack "${HOME}/.local/bin/aistack" "${HOME}/.local/bin/ninestack" "${HOME}/.local/bin/hermesstack" 2>/dev/null || true
 
 # 3. Remove or preserve directories
 if [[ "$PURGE" == "true" ]]; then
@@ -112,10 +112,10 @@ if [[ "$PURGE" == "true" ]]; then
         info "Removing directory: $d"
         rm -rf "$d"
     done
-    success "HermesStack and all associated data completely purged."
+    success "NineStack and all associated data completely purged."
 else
     for d in "${STACK_DIRS[@]}"; do
         info "Preserved data directory: $d (Run with --purge to delete)"
     done
-    success "HermesStack containers stopped and CLI removed."
+    success "NineStack containers stopped and CLI removed."
 fi

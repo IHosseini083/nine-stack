@@ -1,6 +1,6 @@
 # Proxy & Xray Configuration Guide
 
-HermesStack provides two methods to route AI API calls through proxies:
+NineStack provides two methods to route AI API calls through proxies:
 1. **Embedded Xray Container** (imported share links with balancer).
 2. **External Proxy URL** (existing SOCKS5, HTTP, or HTTPS proxy).
 

@@ -1,4 +1,4 @@
-# Running HermesStack on Iranian VPS & Restricted Networks
+# Running NineStack on Iranian VPS & Restricted Networks
 
 Iranian servers face severe network restrictions when communicating with international infrastructure:
 1. Docker Hub and container registries block Iranian IP addresses (HTTP 403 Forbidden).
@@ -6,7 +6,7 @@ Iranian servers face severe network restrictions when communicating with interna
 3. DNS hijacking / poisoning alters international domain queries to `10.10.34.x`.
 4. High packet fragmentation and low ISP MTU thresholds cause TLS handshake failures.
 
-HermesStack embeds dedicated mitigation tools for each bottleneck.
+NineStack embeds dedicated mitigation tools for each bottleneck.
 
 ---
 
@@ -65,15 +65,15 @@ If the target server has zero international connectivity, export container image
 
 ```bash
 # On foreign server or laptop with Docker:
-git clone https://github.com/IHosseini083/HermesStack.git
-cd HermesStack
-./manage.sh bundle export /tmp/hermes-stack-bundle.tar.gz
+git clone https://github.com/IHosseini083/nine-stack.git
+cd nine-stack
+./manage.sh bundle export /tmp/nine-stack-bundle.tar.gz
 ```
 
 Transfer the tarball to your Iranian VPS and import:
 ```bash
 # On Iranian VPS:
-aistack bundle import /path/to/hermes-stack-bundle.tar.gz
+aistack bundle import /path/to/nine-stack-bundle.tar.gz
 ```
 
-All required images (`9router`, `hermes-agent`, `caddy`, `xray`) are loaded offline into the Docker engine.
+All required images (`9router`, `caddy`, `xray`) are loaded offline into the Docker engine.

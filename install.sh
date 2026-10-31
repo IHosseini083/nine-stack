@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# HermesStack One-Liner Installer & Updater
+# NineStack One-Liner Installer & Updater
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/IHosseini083/HermesStack/main/install.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/IHosseini083/HermesStack/main/install.sh | bash -s -- --no-start
-#   curl -fsSL https://raw.githubusercontent.com/IHosseini083/HermesStack/main/install.sh | bash -s -- --update
+#   curl -fsSL https://raw.githubusercontent.com/IHosseini083/nine-stack/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/IHosseini083/nine-stack/main/install.sh | bash -s -- --no-start
+#   curl -fsSL https://raw.githubusercontent.com/IHosseini083/nine-stack/main/install.sh | bash -s -- --update
 # ==============================================================================
 set -Eeuo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/IHosseini083/HermesStack/main"
+REPO_RAW="https://raw.githubusercontent.com/IHosseini083/nine-stack/main"
 
 # Color helpers
 if [[ -t 1 ]] && [[ "${NO_COLOR:-}" != "1" ]]; then
@@ -46,16 +46,16 @@ done
 
 printf "\n"
 printf "  %b╭──────────────────────────────────────────────────────────────────────╮%b\n" "$C_CYAN" "$C_RESET"
-printf "  %b│%b  %b⚡ HERMES STACK INSTALLER & UPDATER%b                                 %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
-printf "  %b│%b  9Router • Hermes Agent • Caddy Auto-TLS • Xray Anti-Censorship      %b│%b\n" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
+printf "  %b│%b  %b⚡ NINE-STACK INSTALLER & UPDATER%b                                  %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
+printf "  %b│%b  9Router LLM Gateway • Caddy Auto-TLS • Xray Anti-Censorship      %b│%b\n" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
 printf "  %b╰──────────────────────────────────────────────────────────────────────╯%b\n\n" "$C_CYAN" "$C_RESET"
 
 # Determine unified stack directory (single source of truth for CLI + data)
 if [[ "$(id -u)" -eq 0 ]]; then
-    INSTALL_DIR="${STACK_DIR:-/opt/ai-stack}"
+    INSTALL_DIR="${STACK_DIR:-/opt/nine-stack}"
     BIN_DIR="/usr/local/bin"
 else
-    INSTALL_DIR="${STACK_DIR:-${HOME}/ai-stack}"
+    INSTALL_DIR="${STACK_DIR:-${HOME}/nine-stack}"
     BIN_DIR="${HOME}/.local/bin"
 fi
 
@@ -66,7 +66,7 @@ TMP_SCRIPT="$(mktemp -p /tmp aistack-install-XXXXXX)"
 cleanup_tmp() { rm -f "$TMP_SCRIPT" 2>/dev/null || true; }
 trap cleanup_tmp EXIT
 
-info "Downloading HermesStack Manager to $INSTALL_DIR/manage.sh..."
+info "Downloading NineStack Manager to $INSTALL_DIR/manage.sh..."
 if command -v curl >/dev/null 2>&1; then
     curl -fsSL --retry 3 --connect-timeout 10 "${REPO_RAW}/manage.sh" -o "$TMP_SCRIPT"
 elif command -v wget >/dev/null 2>&1; then
@@ -83,7 +83,7 @@ mv -f "$TMP_SCRIPT" "$INSTALL_DIR/manage.sh"
 chmod +x "$INSTALL_DIR/manage.sh"
 
 # Clean up legacy duplicate script directory if present
-for legacy_dir in "/opt/hermes-stack" "${HOME}/.hermes-stack"; do
+for legacy_dir in "/opt/ai-stack" "/opt/hermes-stack" "${HOME}/ai-stack" "${HOME}/.hermes-stack"; do
     if [[ -d "$legacy_dir" ]] && [[ "$legacy_dir" != "$INSTALL_DIR" ]] && [[ ! -f "$legacy_dir/.env" ]]; then
         rm -rf "$legacy_dir" 2>/dev/null || true
     fi
@@ -91,20 +91,16 @@ done
 
 # Install CLI symlinks
 ln -sf "$INSTALL_DIR/manage.sh" "$BIN_DIR/aistack"
+ln -sf "$INSTALL_DIR/manage.sh" "$BIN_DIR/ninestack" 2>/dev/null || true
 ln -sf "$INSTALL_DIR/manage.sh" "$BIN_DIR/hermesstack" 2>/dev/null || true
-
-# Auto-heal Hermes config.yaml if an existing installation is present
-if [[ -f "$INSTALL_DIR/hermes/config.yaml" ]]; then
-    "$INSTALL_DIR/manage.sh" --dir "$INSTALL_DIR" hermes fix-config >/dev/null 2>&1 || true
-fi
 
 # Verify PATH
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     warn "$BIN_DIR is not in your PATH. Add to ~/.bashrc: export PATH=\"\$PATH:$BIN_DIR\""
 fi
 
-success "HermesStack CLI installed at: $INSTALL_DIR/manage.sh"
-success "Global commands ready:        aistack (or hermesstack)"
+success "NineStack CLI installed at: $INSTALL_DIR/manage.sh"
+success "Global commands ready:        aistack, ninestack (or hermesstack)"
 
 if [[ "$NO_START" == "true" ]] || [[ "$UPDATE_ONLY" == "true" ]]; then
     info "CLI updated. Run 'aistack' to open the interactive TUI or 'aistack setup' to re-run wizard."
