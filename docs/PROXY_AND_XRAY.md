@@ -31,10 +31,23 @@ Then regenerate the balancer configuration:
 aistack restart
 ```
 
-### Balancer & Observatory
+### Balancer, Observatory & DNS Poisoning Protection
 - Automatically probes nodes every 60 seconds against `https://api.openai.com`.
 - Selects the lowest-latency responsive node for all outbound requests.
-- Routes Iranian domestic IPs (`geoip:ir`) and private RFC1918 subnets directly via the `direct` outbound.
+- Uses `domainStrategy: "AsIs"` with HTTP/TLS destination sniffing (`routeOnly: true`) and remote DNS resolution (`socks5h://`) so Iranian DNS poisoning (`10.10.34.x`) never triggers private-IP direct bypass rules.
+- Routes Iranian domestic domains/IPs (`geosite:ir`, `geoip:ir`) and local RFC1918 subnets (`127.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) directly via the `direct` outbound.
+- Exposes `127.0.0.1:10808` (SOCKS5) and `127.0.0.1:10809` (HTTP) to the host so both containers (`NODE_USE_ENV_PROXY=1`, `GLOBAL_AGENT_HTTP_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`) and host commands can use Xray for outbound requests.
+
+### Using the Stack Proxy on the Host
+Route any host command (such as `curl`, `git`, `pip`, `npm`, or `apt`) through the active stack proxy:
+```bash
+aistack proxy exec curl -I https://api.openai.com
+```
+
+Or export the proxy environment variables into your current shell session:
+```bash
+eval "$(aistack proxy env)"
+```
 
 ---
 

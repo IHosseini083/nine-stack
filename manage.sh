@@ -248,6 +248,18 @@ ensure_stack_secrets() {
     if [[ -z "$(env_get "PROXY_MODE" "")" ]]; then
         env_set "PROXY_MODE" "none"
     fi
+    if [[ -z "$(env_get "HERMES_DASHBOARD_ENABLED" "")" ]]; then
+        env_set "HERMES_DASHBOARD_ENABLED" "true"
+    fi
+    if [[ -z "$(env_get "HERMES_API_ENABLED" "")" ]]; then
+        env_set "HERMES_API_ENABLED" "true"
+    fi
+    if [[ -z "$(env_get "CADDY_ENABLED" "")" ]]; then
+        env_set "CADDY_ENABLED" "auto"
+    fi
+    if [[ -z "$(env_get "NINE_ROUTER_MAX_MEM" "")" ]]; then
+        env_set "NINE_ROUTER_MAX_MEM" "256"
+    fi
 }
 
 # ------------------------------------------------------------------------------
@@ -508,19 +520,29 @@ config = {
             'port': 10808,
             'listen': '0.0.0.0',
             'protocol': 'socks',
-            'settings': {'auth': 'noauth', 'udp': True}
+            'settings': {'auth': 'noauth', 'udp': True},
+            'sniffing': {
+                'enabled': True,
+                'destOverride': ['http', 'tls'],
+                'routeOnly': True
+            }
         },
         {
             'tag': 'http-in',
             'port': 10809,
             'listen': '0.0.0.0',
             'protocol': 'http',
-            'settings': {'allowTransparent': False}
+            'settings': {'allowTransparent': False},
+            'sniffing': {
+                'enabled': True,
+                'destOverride': ['http', 'tls'],
+                'routeOnly': True
+            }
         }
     ],
     'outbounds': outbounds,
     'routing': {
-        'domainStrategy': 'IPIfNonMatch',
+        'domainStrategy': 'AsIs',
         'balancers': [
             {
                 'tag': 'balancer',
@@ -531,7 +553,12 @@ config = {
         'rules': [
             {
                 'type': 'field',
-                'ip': ['geoip:private', 'geoip:ir'],
+                'domain': ['geosite:private', 'geosite:ir', 'domain:ir'],
+                'outboundTag': 'direct'
+            },
+            {
+                'type': 'field',
+                'ip': ['geoip:ir', '127.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'],
                 'outboundTag': 'direct'
             },
             {
@@ -552,6 +579,76 @@ with open(config_file, 'w', encoding='utf-8') as f:
     json.dump(config, f, indent=2)
 " "$links_file" "$config_file" "$SCRIPT_PATH"
     chmod 644 "$config_file" 2>/dev/null || true
+}
+
+# Return active proxy URL usable from the host OS when proxy is enabled
+get_active_host_proxy() {
+    local enabled
+    enabled=$(env_get "PROXY_ENABLED" "false")
+    [[ "$enabled" != "true" ]] && return 0
+    
+    local mode
+    mode=$(env_get "PROXY_MODE" "none")
+    if [[ "$mode" == "external" ]]; then
+        env_get "PROXY_URL" ""
+    elif [[ "$mode" == "xray" ]]; then
+        printf "http://127.0.0.1:10809\n"
+    fi
+}
+
+# Wrapper for curl that automatically routes through the stack proxy when enabled
+outbound_curl() {
+    local proxy_url
+    proxy_url=$(get_active_host_proxy)
+    if [[ -n "$proxy_url" ]]; then
+        curl --proxy "$proxy_url" "$@"
+    else
+        curl "$@"
+    fi
+}
+
+# Print exportable proxy environment variables for host shell usage
+proxy_env() {
+    local proxy_url
+    proxy_url=$(get_active_host_proxy)
+    if [[ -z "$proxy_url" ]]; then
+        warn "Proxy is not currently enabled."
+        return 1
+    fi
+    local socks_url="$proxy_url"
+    if [[ "$(env_get "PROXY_MODE" "none")" == "xray" ]]; then
+        socks_url="socks5h://127.0.0.1:10808"
+    fi
+    cat << EOF
+export HTTP_PROXY="${proxy_url}"
+export HTTPS_PROXY="${proxy_url}"
+export ALL_PROXY="${socks_url}"
+export http_proxy="${proxy_url}"
+export https_proxy="${proxy_url}"
+export all_proxy="${socks_url}"
+export NO_PROXY="localhost,127.0.0.1,172.16.0.0/12,192.168.0.0/16,.ir"
+export no_proxy="localhost,127.0.0.1,172.16.0.0/12,192.168.0.0/16,.ir"
+EOF
+}
+
+# Execute any host command routed through the active stack proxy
+proxy_exec() {
+    if [[ $# -eq 0 ]]; then
+        die "Usage: $SCRIPT_NAME proxy exec <command> [args...]"
+    fi
+    local proxy_url
+    proxy_url=$(get_active_host_proxy)
+    if [[ -z "$proxy_url" ]]; then
+        die "Proxy is not enabled. Enable it first with '$SCRIPT_NAME proxy add-link' or 'set-external'."
+    fi
+    local socks_url="$proxy_url"
+    if [[ "$(env_get "PROXY_MODE" "none")" == "xray" ]]; then
+        socks_url="socks5h://127.0.0.1:10808"
+    fi
+    HTTP_PROXY="$proxy_url" HTTPS_PROXY="$proxy_url" ALL_PROXY="$socks_url" \
+    http_proxy="$proxy_url" https_proxy="$proxy_url" all_proxy="$socks_url" \
+    NODE_USE_ENV_PROXY=1 \
+    "$@"
 }
 
 # Proxy status output
@@ -575,7 +672,8 @@ proxy_status() {
             links_count=$(grep -cve '^\s*$' "$STACK_DIR/xray/links.txt" 2>/dev/null || true)
         fi
         printf "  Nodes:   %s links imported\n" "$links_count"
-        printf "  Inbound: socks5://xray:10808, http://xray:10809\n"
+        printf "  Stack:   socks5h://xray:10808, http://xray:10809\n"
+        printf "  Host:    socks5h://127.0.0.1:10808, http://127.0.0.1:10809\n"
     fi
 }
 
@@ -591,6 +689,7 @@ proxy_set_external() {
     env_set "PROXY_URL" "$url"
     env_set "PROXY_MODE" "external"
     env_set "PROXY_ENABLED" "true"
+    generate_docker_compose
     success "Configured external proxy: $url"
 }
 
@@ -617,6 +716,7 @@ proxy_add_link() {
     xray_generate_config
     env_set "PROXY_MODE" "xray"
     env_set "PROXY_ENABLED" "true"
+    generate_docker_compose
     success "Added node and re-generated Xray balancer configuration."
 }
 
@@ -628,6 +728,7 @@ proxy_clear_links() {
         env_set "PROXY_MODE" "none"
         env_set "PROXY_ENABLED" "false"
     fi
+    generate_docker_compose
     success "Cleared all Xray links."
 }
 
@@ -639,11 +740,13 @@ proxy_enable() {
         return 1
     fi
     env_set "PROXY_ENABLED" "true"
+    generate_docker_compose
     success "Proxy enabled ($mode mode)."
 }
 
 proxy_disable() {
     env_set "PROXY_ENABLED" "false"
+    generate_docker_compose
     success "Proxy disabled."
 }
 
@@ -822,7 +925,7 @@ install_docker_fallback() {
     fi
     
     info "Trying official get.docker.com script..."
-    if curl -fsSL --connect-timeout 10 https://get.docker.com | bash; then
+    if outbound_curl -fsSL --connect-timeout 10 https://get.docker.com | bash; then
         success "Docker installed via get.docker.com"
         return 0
     fi
@@ -1144,7 +1247,15 @@ domain_add() {
         merge_hermes_config "$current_model" "$current_key" "$domain"
     fi
     
-    caddy_reload
+    generate_docker_compose
+    if ! docker compose -f "$STACK_DIR/docker-compose.yml" ps --services --filter "status=running" 2>/dev/null | grep -q "^caddy$"; then
+        if docker compose -f "$STACK_DIR/docker-compose.yml" ps --services --filter "status=running" 2>/dev/null | grep -q "^nine-router$"; then
+            info "Starting Caddy reverse proxy for newly added domain..."
+            docker compose -f "$STACK_DIR/docker-compose.yml" up -d caddy
+        fi
+    else
+        caddy_reload
+    fi
     success "Domain $domain configured successfully."
 }
 
@@ -1168,6 +1279,72 @@ domain_rm() {
     generate_caddyfile
     caddy_reload
     success "Domain $domain removed."
+}
+
+# ------------------------------------------------------------------------------
+# Optional Features & Lightweight Mode Subsystem
+# ------------------------------------------------------------------------------
+
+features_status() {
+    init_paths
+    ensure_stack_secrets
+    local dash_en
+    dash_en=$(env_get "HERMES_DASHBOARD_ENABLED" "true")
+    local api_en
+    api_en=$(env_get "HERMES_API_ENABLED" "true")
+    local caddy_en
+    caddy_en=$(env_get "CADDY_ENABLED" "auto")
+    local router_mem
+    router_mem=$(env_get "NINE_ROUTER_MAX_MEM" "256")
+    
+    printf "%bOptional Features & Resource Limits:%b\n" "$C_BOLD" "$C_RESET"
+    printf "  Hermes Web UI (Port 9119):  %s\n" "$([[ "$dash_en" == "true" ]] && printf "%bEnabled%b" "$C_GREEN" "$C_RESET" || printf "%bDisabled (Lightweight)%b" "$C_YELLOW" "$C_RESET")"
+    printf "  Hermes API (Port 8642):     %s\n" "$([[ "$api_en" == "true" ]] && printf "%bEnabled%b" "$C_GREEN" "$C_RESET" || printf "%bDisabled (Lightweight)%b" "$C_YELLOW" "$C_RESET")"
+    printf "  Caddy Reverse Proxy:        %s\n" "$caddy_en (auto = runs only when domains exist)"
+    printf "  9Router V8 Heap Cap:        %s MB\n" "$router_mem"
+}
+
+features_set() {
+    init_paths
+    local feature="${1:-}"
+    local val="${2:-}"
+    
+    case "$feature" in
+        dashboard)
+            case "$val" in
+                on|true|1)  env_set "HERMES_DASHBOARD_ENABLED" "true"; success "Hermes Web UI enabled." ;;
+                off|false|0) env_set "HERMES_DASHBOARD_ENABLED" "false"; success "Hermes Web UI disabled (lightweight mode)." ;;
+                *) die "Usage: $SCRIPT_NAME features dashboard <on|off>" ;;
+            esac
+            ;;
+        api)
+            case "$val" in
+                on|true|1)  env_set "HERMES_API_ENABLED" "true"; success "Hermes API server enabled." ;;
+                off|false|0) env_set "HERMES_API_ENABLED" "false"; success "Hermes API server disabled (lightweight mode)." ;;
+                *) die "Usage: $SCRIPT_NAME features api <on|off>" ;;
+            esac
+            ;;
+        caddy)
+            case "$val" in
+                auto)        env_set "CADDY_ENABLED" "auto"; success "Caddy set to auto (runs only when domains are configured)." ;;
+                on|true|1)   env_set "CADDY_ENABLED" "true"; success "Caddy forced on." ;;
+                off|false|0) env_set "CADDY_ENABLED" "false"; success "Caddy disabled." ;;
+                *) die "Usage: $SCRIPT_NAME features caddy <auto|on|off>" ;;
+            esac
+            ;;
+        memory)
+            if [[ "$val" =~ ^[0-9]+$ ]] && [[ "$val" -ge 128 ]]; then
+                env_set "NINE_ROUTER_MAX_MEM" "$val"
+                success "9Router max V8 memory limit set to ${val}MB."
+            else
+                die "Usage: $SCRIPT_NAME features memory <megabytes> (min: 128)"
+            fi
+            ;;
+        *)
+            die "Usage: $SCRIPT_NAME features <status|dashboard|api|caddy|memory> [value]"
+            ;;
+    esac
+    generate_docker_compose
 }
 
 # ------------------------------------------------------------------------------
@@ -1208,6 +1385,15 @@ generate_docker_compose() {
     local api_server_key
     api_server_key=$(env_get "API_SERVER_KEY")
     
+    local dash_enabled
+    dash_enabled=$(env_get "HERMES_DASHBOARD_ENABLED" "true")
+    local api_enabled
+    api_enabled=$(env_get "HERMES_API_ENABLED" "true")
+    local caddy_enabled
+    caddy_enabled=$(env_get "CADDY_ENABLED" "auto")
+    local router_max_mem
+    router_max_mem=$(env_get "NINE_ROUTER_MAX_MEM" "256")
+    
     python3 -c "
 import sys, os
 
@@ -1229,23 +1415,33 @@ hermes_secret = sys.argv[13]
 api_server_key = sys.argv[14]
 stack_dir = sys.argv[15]
 
+dash_enabled = sys.argv[16] == 'true'
+api_enabled = sys.argv[17] == 'true'
+caddy_mode = sys.argv[18]
+router_max_mem = sys.argv[19]
+
 http_proxy_val = ''
+socks_proxy_val = ''
 if proxy_enabled:
     if proxy_mode == 'xray':
         http_proxy_val = 'http://xray:10809'
+        socks_proxy_val = 'socks5h://xray:10808'
     elif proxy_mode == 'external' and proxy_url:
         http_proxy_val = proxy_url
+        socks_proxy_val = proxy_url
 
 proxy_env_block = ''
 if http_proxy_val:
     proxy_env_block = f'''      - HTTP_PROXY={http_proxy_val}
       - HTTPS_PROXY={http_proxy_val}
-      - ALL_PROXY={http_proxy_val}
+      - ALL_PROXY={socks_proxy_val}
       - http_proxy={http_proxy_val}
       - https_proxy={http_proxy_val}
-      - all_proxy={http_proxy_val}
-      - NO_PROXY=localhost,127.0.0.1,nine-router,hermes,caddy,xray
-      - no_proxy=localhost,127.0.0.1,nine-router,hermes,caddy,xray'''
+      - all_proxy={socks_proxy_val}
+      - NODE_USE_ENV_PROXY=1
+      - GLOBAL_AGENT_HTTP_PROXY={http_proxy_val}
+      - NO_PROXY=localhost,127.0.0.1,nine-router,hermes,caddy,xray,172.16.0.0/12,192.168.0.0/16,.ir
+      - no_proxy=localhost,127.0.0.1,nine-router,hermes,caddy,xray,172.16.0.0/12,192.168.0.0/16,.ir'''
 
 xray_service_block = ''
 if proxy_enabled and proxy_mode == 'xray':
@@ -1253,78 +1449,50 @@ if proxy_enabled and proxy_mode == 'xray':
     image: teddysun/xray:latest
     container_name: ai-stack-xray
     restart: unless-stopped
+    ports:
+      - \"127.0.0.1:10808:10808\"
+      - \"127.0.0.1:10809:10809\"
     volumes:
       - {stack_dir}/xray/config.json:/etc/xray/config.json:ro
+    healthcheck:
+      test: [\"CMD-SHELL\", \"nc -z 127.0.0.1 10808 || exit 1\"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     logging:
       driver: json-file
       options:
-        max-size: \"10m\"
-        max-file: \"3\"
+        max-size: \"5m\"
+        max-file: \"2\"
 '''
 
-compose_content = f'''name: ai-stack
+# Build Hermes ports and healthcheck based on enabled optional features
+hermes_ports = []
+if dash_enabled:
+    hermes_ports.append('      - \"127.0.0.1:9119:9119\"')
+if api_enabled:
+    hermes_ports.append('      - \"127.0.0.1:8642:8642\"')
+hermes_ports_block = ('    ports:\n' + '\n'.join(hermes_ports)) if hermes_ports else ''
 
-services:
-{xray_service_block}  nine-router:
-    image: decolua/9router:latest
-    container_name: ai-stack-nine-router
-    restart: unless-stopped
-    ports:
-      - \"127.0.0.1:20128:20128\"
-    environment:
-      - DATA_DIR=/app/data
-      - JWT_SECRET={jwt_secret}
-      - API_KEY_SECRET={api_key_secret}
-      - MACHINE_ID_SALT={machine_id_salt}
-      - INITIAL_PASSWORD={initial_password}
-      - REQUIRE_API_KEY={require_api_key}
-      - AUTH_COOKIE_SECURE={auth_cookie_secure}
-{proxy_env_block}
-    volumes:
-      - nine_router_data:/app/data
-    healthcheck:
-      test: [\"CMD-SHELL\", \"curl -f http://localhost:20128/api/health || exit 1\"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
-    logging:
-      driver: json-file
-      options:
-        max-size: \"10m\"
-        max-file: \"3\"
+hermes_dash_flag = '1' if dash_enabled else '0'
+hermes_api_flag = 'true' if api_enabled else 'false'
+hermes_hc_cmd = 'curl -f http://localhost:9119/ || exit 1' if dash_enabled else 'pgrep -f hermes >/dev/null || exit 1'
 
-  hermes:
-    image: nousresearch/hermes-agent:latest
-    container_name: ai-stack-hermes
-    restart: unless-stopped
-    command: gateway run
-    ports:
-      - \"127.0.0.1:9119:9119\"
-      - \"127.0.0.1:8642:8642\"
-    environment:
-      - HERMES_DASHBOARD=1
-      - HERMES_DASHBOARD_BASIC_AUTH_USERNAME={hermes_user}
-      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD={hermes_pass}
-      - HERMES_DASHBOARD_BASIC_AUTH_SECRET={hermes_secret}
-      - API_SERVER_ENABLED=true
-      - API_SERVER_HOST=0.0.0.0
-      - API_SERVER_KEY={api_server_key}
-{proxy_env_block}
-    volumes:
-      - {stack_dir}/hermes:/opt/data
-    healthcheck:
-      test: [\"CMD-SHELL\", \"curl -f http://localhost:9119/ || exit 1\"]
-      interval: 20s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    logging:
-      driver: json-file
-      options:
-        max-size: \"10m\"
-        max-file: \"3\"
+# Decide whether Caddy runs
+has_domains = False
+domains_tsv = os.path.join(stack_dir, 'domains.tsv')
+if os.path.exists(domains_tsv):
+    with open(domains_tsv, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                has_domains = True
+                break
 
+run_caddy = (caddy_mode == 'true') or (caddy_mode == 'auto' and has_domains)
+caddy_service_block = ''
+if run_caddy:
+    caddy_service_block = f'''
   caddy:
     image: caddy:2-alpine
     container_name: ai-stack-caddy
@@ -1341,15 +1509,83 @@ services:
       - caddy_config:/config
     healthcheck:
       test: [\"CMD-SHELL\", \"wget --no-verbose --tries=1 --spider http://localhost:80/ || exit 1\"]
-      interval: 15s
+      interval: 30s
       timeout: 5s
       retries: 3
     logging:
       driver: json-file
       options:
-        max-size: \"10m\"
-        max-file: \"3\"
+        max-size: \"5m\"
+        max-file: \"2\"
+'''
 
+compose_content = f'''name: ai-stack
+
+services:
+{xray_service_block}  nine-router:
+    image: decolua/9router:latest
+    container_name: ai-stack-nine-router
+    restart: unless-stopped
+    ports:
+      - \"127.0.0.1:20128:20128\"
+    environment:
+      - DATA_DIR=/app/data
+      - NODE_OPTIONS=--max-old-space-size={router_max_mem}
+      - NEXT_TELEMETRY_DISABLED=1
+      - JWT_SECRET={jwt_secret}
+      - API_KEY_SECRET={api_key_secret}
+      - MACHINE_ID_SALT={machine_id_salt}
+      - INITIAL_PASSWORD={initial_password}
+      - REQUIRE_API_KEY={require_api_key}
+      - AUTH_COOKIE_SECURE={auth_cookie_secure}
+{proxy_env_block}
+    volumes:
+      - nine_router_data:/app/data
+    healthcheck:
+      test: [\"CMD-SHELL\", \"curl -f http://localhost:20128/api/health || exit 1\"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: \"5m\"
+        max-file: \"2\"
+
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    container_name: ai-stack-hermes
+    restart: unless-stopped
+    command: gateway run
+{hermes_ports_block}
+    environment:
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+      - PIP_NO_CACHE_DIR=1
+      - MALLOC_TRIM_THRESHOLD_=65536
+      - HERMES_DASHBOARD={hermes_dash_flag}
+      - HERMES_DASHBOARD_BASIC_AUTH_USERNAME={hermes_user}
+      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD={hermes_pass}
+      - HERMES_DASHBOARD_BASIC_AUTH_SECRET={hermes_secret}
+      - API_SERVER_ENABLED={hermes_api_flag}
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_KEY={api_server_key}
+{proxy_env_block}
+    volumes:
+      - {stack_dir}/hermes:/opt/data
+    healthcheck:
+      test: [\"CMD-SHELL\", \"{hermes_hc_cmd}\"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: \"5m\"
+        max-file: \"2\"
+{caddy_service_block}
 volumes:
   nine_router_data:
   caddy_data:
@@ -1362,7 +1598,7 @@ with open(out, 'w', encoding='utf-8') as f:
   "$jwt_secret" "$api_key_secret" "$machine_id_salt" "$initial_password" \
   "$require_api_key" "$auth_cookie_secure" \
   "$hermes_user" "$hermes_pass" "$hermes_secret" "$api_server_key" \
-  "$STACK_DIR"
+  "$STACK_DIR" "$dash_enabled" "$api_enabled" "$caddy_enabled" "$router_max_mem"
 
     chmod 600 "$compose_file" 2>/dev/null || true
 }
@@ -1725,9 +1961,11 @@ stack_status() {
         fi
     done
     
-    # 2. Proxy info
+    # 2. Proxy & Features info
     printf "\n"
     proxy_status
+    printf "\n"
+    features_status
     
     # 3. Domains summary
     domain_list
@@ -1741,7 +1979,11 @@ stack_status() {
     printf "%bStack Directory:%b %s (%s)\n" "$C_BOLD" "$C_RESET" "$STACK_DIR" "$disk_usage"
     printf "%bHermes Model:%b    %s\n" "$C_BOLD" "$C_RESET" "$active_model"
     printf "%b9Router Admin:%b    http://localhost:20128/admin (Initial password: %s)\n" "$C_BOLD" "$C_RESET" "$(env_get "INITIAL_PASSWORD" "123456")"
-    printf "%bHermes Portal:%b    http://localhost:9119 (User: %s / Pass: %s)\n" "$C_BOLD" "$C_RESET" "$(env_get "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "admin")" "$(env_get "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "admin123")"
+    if [[ "$(env_get "HERMES_DASHBOARD_ENABLED" "true")" == "true" ]]; then
+        printf "%bHermes Portal:%b    http://localhost:9119 (User: %s / Pass: %s)\n" "$C_BOLD" "$C_RESET" "$(env_get "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "admin")" "$(env_get "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "admin123")"
+    else
+        printf "%bHermes Portal:%b    %bDisabled (Lightweight mode)%b\n" "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+    fi
     printf "\n"
 }
 
@@ -1838,18 +2080,26 @@ except Exception:
         fi
     fi
     
-    # Test AI Endpoints
-    info "Inspecting AI Provider APIs..."
-    local endpoints=("api.openai.com" "openrouter.ai" "api.anthropic.com")
+    # Test AI & External Endpoints (Direct vs via Stack Proxy)
+    info "Inspecting Outbound AI & External APIs..."
+    local endpoints=("api.openai.com" "openrouter.ai" "api.anthropic.com" "api.telegram.org")
+    local proxy_on
+    proxy_on=$(env_get "PROXY_ENABLED" "false")
     for ep in "${endpoints[@]}"; do
-        if curl -s --connect-timeout 4 -I "https://${ep}" >/dev/null 2>&1; then
-            success "  https://${ep}: Reachable directly"
-        else
-            warn "  https://${ep}: Unreachable directly."
-            if [[ "$(env_get "PROXY_ENABLED" "false")" == "true" ]]; then
-                info "  (Stack proxy is enabled to route traffic)"
+        if [[ "$proxy_on" == "true" ]]; then
+            if outbound_curl -s --connect-timeout 5 -I "https://${ep}" >/dev/null 2>&1; then
+                success "  https://${ep}: Reachable via Stack Proxy ($(get_active_host_proxy))"
+            elif curl -s --connect-timeout 4 -I "https://${ep}" >/dev/null 2>&1; then
+                warn "  https://${ep}: Reachable directly, but Stack Proxy ($(get_active_host_proxy)) is not responding (is Xray running?)."
             else
-                warn "  (Stack proxy is NOT enabled. Outbound AI calls may fail!)"
+                err "  https://${ep}: Unreachable via Stack Proxy ($(get_active_host_proxy)). Check Xray links or external proxy!"
+                ((issues++)) || true
+            fi
+        else
+            if curl -s --connect-timeout 4 -I "https://${ep}" >/dev/null 2>&1; then
+                success "  https://${ep}: Reachable directly"
+            else
+                warn "  https://${ep}: Unreachable directly (Stack proxy is disabled; enable proxy to bypass restriction)."
                 ((issues++)) || true
             fi
         fi
@@ -1925,17 +2175,24 @@ stack_setup() {
         env_set "INITIAL_PASSWORD" "$in_pass"
     fi
     
-    # 3. Hermes Dashboard Credentials
-    printf "\n%bHermes Agent Dashboard Credentials:%b\n" "$C_BOLD" "$C_RESET"
-    local cur_huser
-    cur_huser=$(env_get "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "admin")
-    read -r -p "Dashboard username (default: $cur_huser): " in_huser
-    env_set "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "${in_huser:-$cur_huser}"
-    
-    local cur_hpass
-    cur_hpass=$(env_get "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "admin123")
-    read -r -p "Dashboard password (default: $cur_hpass): " in_hpass
-    env_set "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "${in_hpass:-$cur_hpass}"
+    # 3. Hermes Optional Web UI & Credentials
+    printf "\n%bHermes Agent Web UI (Optional):%b\n" "$C_BOLD" "$C_RESET"
+    read -r -p "Enable Hermes Web UI Dashboard on port 9119? (Disable to save RAM) [Y/n]: " enable_dash
+    if [[ "${enable_dash:-y}" =~ ^[Nn]$ ]]; then
+        env_set "HERMES_DASHBOARD_ENABLED" "false"
+        info "Hermes Web UI disabled (lightweight mode)."
+    else
+        env_set "HERMES_DASHBOARD_ENABLED" "true"
+        local cur_huser
+        cur_huser=$(env_get "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "admin")
+        read -r -p "Dashboard username (default: $cur_huser): " in_huser
+        env_set "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "${in_huser:-$cur_huser}"
+        
+        local cur_hpass
+        cur_hpass=$(env_get "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "admin123")
+        read -r -p "Dashboard password (default: $cur_hpass): " in_hpass
+        env_set "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "${in_hpass:-$cur_hpass}"
+    fi
     
     # 4. Default AI Model
     printf "\n%bDefault AI Model:%b\n" "$C_BOLD" "$C_RESET"
@@ -2034,9 +2291,10 @@ interactive_menu() {
         printf "  8) Backup & Restore (SQLite + SSL + Configs)\n"
         printf "  9) Update Stack Images (With Auto-Rollback)\n"
         printf " 10) View Container Logs\n"
+        printf " 11) Optional Features & Lightweight Mode\n"
         printf "  0) Exit\n"
-        printf "--------------------------------------------------\n"
-        read -r -p "Select option [0-10]: " opt
+        printf "%s\n" "--------------------------------------------------"
+        read -r -p "Select option [0-11]: " opt
         
         case "$opt" in
             1) stack_status ;;
@@ -2053,7 +2311,7 @@ interactive_menu() {
                 esac
                 ;;
             6)
-                printf "\nProxy Menu:\n 1) Status\n 2) Add Xray Share Link\n 3) Set External URL\n 4) Clear Links\n 5) Disable\n"
+                printf "\nProxy Menu:\n 1) Status\n 2) Add Xray Share Link\n 3) Set External URL\n 4) Clear Links\n 5) Disable\n 6) Show Host Proxy Env Vars\n"
                 read -r -p "Choice: " p_opt
                 case "$p_opt" in
                     1) proxy_status ;;
@@ -2061,6 +2319,7 @@ interactive_menu() {
                     3) proxy_set_external "" ;;
                     4) proxy_clear_links ;;
                     5) proxy_disable ;;
+                    6) proxy_env || true ;;
                 esac
                 ;;
             7) stack_doctor ;;
@@ -2076,6 +2335,17 @@ interactive_menu() {
                 ;;
             9) stack_update ;;
             10) stack_logs "" ;;
+            11)
+                features_status
+                printf "\nFeatures Menu:\n 1) Toggle Hermes Web UI (on/off)\n 2) Toggle Hermes API Server (on/off)\n 3) Set Caddy Mode (auto/on/off)\n 4) Set 9Router Max Memory (MB)\n"
+                read -r -p "Choice: " f_opt
+                case "$f_opt" in
+                    1) read -r -p "Hermes Web UI [on/off]: " v; features_set dashboard "$v" ;;
+                    2) read -r -p "Hermes API [on/off]: " v; features_set api "$v" ;;
+                    3) read -r -p "Caddy Mode [auto/on/off]: " v; features_set caddy "$v" ;;
+                    4) read -r -p "9Router Max Memory MB [e.g. 256]: " v; features_set memory "$v" ;;
+                esac
+                ;;
             0|q|Q) break ;;
             *) warn "Invalid selection." ;;
         esac
@@ -2123,6 +2393,15 @@ Proxy Commands:
   proxy set-external [url] Set external SOCKS5/HTTP proxy URL
   proxy clear           Remove all imported links
   proxy enable/disable  Toggle stack proxy routing
+  proxy env             Output exportable HTTP_PROXY/ALL_PROXY env vars for host shell
+  proxy exec <cmd...>   Run a host command routed through the active stack proxy
+
+Feature & Lightweight Mode Commands:
+  features status                Show optional features and memory caps
+  features dashboard <on|off>    Toggle Hermes Web UI (Port 9119)
+  features api <on|off>          Toggle Hermes API server (Port 8642)
+  features caddy <auto|on|off>   Set Caddy mode (auto = only runs when domains exist)
+  features memory <MB>           Set 9Router V8 max memory limit in MB (default: 256)
 
 Backup Commands:
   backup create [tag]   Create full consistent backup archive (SQLite + SSL + Config)
@@ -2243,7 +2522,18 @@ case "$CMD" in
             clear) proxy_clear_links ;;
             enable) proxy_enable ;;
             disable) proxy_disable ;;
+            env) proxy_env ;;
+            exec) proxy_exec "$@" ;;
             *) die "Unknown proxy subcommand: $sub" ;;
+        esac
+        ;;
+    features)
+        sub="${1:-status}"
+        shift || true
+        case "$sub" in
+            status) features_status ;;
+            dashboard|api|caddy|memory) features_set "$sub" "${1:-}" ;;
+            *) die "Unknown features subcommand: $sub" ;;
         esac
         ;;
     backup)

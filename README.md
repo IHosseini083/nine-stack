@@ -16,6 +16,7 @@ A production-ready, self-hosted AI deployment stack combining **9Router** (LLM r
 - [Quickstart](#quickstart)
 - [Command Reference](#command-reference)
   - [Lifecycle & Status](#lifecycle--status)
+  - [Optional Features & Lightweight Mode](#optional-features--lightweight-mode)
   - [Domain Management](#domain-management)
   - [Proxy & Censorship Circumvention](#proxy--censorship-circumvention)
   - [Backups & Rollback](#backups--rollback)
@@ -95,6 +96,15 @@ HermesStack can be managed interactively by running `aistack`, or non-interactiv
 | `aistack update` | Pull latest images with auto-backup and healthcheck verification |
 | `aistack rollback` | Revert to previous container image digests if update failed |
 
+### Optional Features & Lightweight Mode
+| Command | Description |
+| :--- | :--- |
+| `aistack features status` | Show optional features (`dashboard`, `api`, `caddy`) and memory caps |
+| `aistack features dashboard <on\|off>` | Enable or disable Hermes Web UI on port 9119 to save RAM |
+| `aistack features api <on\|off>` | Enable or disable Hermes HTTP API server on port 8642 |
+| `aistack features caddy <auto\|on\|off>` | Control Caddy container (`auto` only starts Caddy when domains exist) |
+| `aistack features memory <MB>` | Set 9Router Node.js V8 heap limit in MB (default: `256`) |
+
 ### Domain Management
 | Command | Description |
 | :--- | :--- |
@@ -111,6 +121,8 @@ HermesStack can be managed interactively by running `aistack`, or non-interactiv
 | `aistack proxy set-external "<url>"` | Route outbound AI traffic through an external HTTP/SOCKS5 proxy |
 | `aistack proxy enable` / `disable` | Toggle proxy routing on or off |
 | `aistack proxy clear` | Remove all imported Xray links |
+| `aistack proxy env` | Output exportable `HTTP_PROXY`/`ALL_PROXY` variables for the host shell |
+| `aistack proxy exec <cmd...>` | Execute any host command routed through the active Xray/external proxy |
 
 ### Backups & Rollback
 | Command | Description |

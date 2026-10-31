@@ -49,10 +49,14 @@ import json
 with open('$TEST_TEMP/xray/config.json', 'r') as f:
     cfg = json.load(f)
 assert len(cfg['outbounds']) >= 4, 'Expected at least 2 proxy nodes + direct + block'
+assert cfg['routing']['domainStrategy'] == 'AsIs', 'Expected AsIs to prevent DNS poisoning bypass'
+assert cfg['inbounds'][0]['sniffing']['enabled'] is True
 assert cfg['routing']['balancers'][0]['strategy']['type'] == 'leastPing'
-assert 'geoip:ir' in cfg['routing']['rules'][0]['ip']
+assert 'geosite:ir' in cfg['routing']['rules'][0]['domain']
+assert 'geoip:ir' in cfg['routing']['rules'][1]['ip']
+assert 'geoip:private' not in cfg['routing']['rules'][1]['ip']
 "
-echo "  Xray configuration and observatory verified."
+echo "  Xray configuration, DNS poisoning protection, and observatory verified."
 
 # 4. Test Hermes config.yaml preservation
 echo "[4/6] Testing Hermes config.yaml merge logic..."
@@ -104,8 +108,39 @@ assert 'tls internal' in c
 "
 echo "  Caddyfile structure verified."
 
-# 6. Test Doctor
-echo "[6/6] Testing Doctor diagnostics..."
+# 6. Test Lightweight Features & Outbound Proxy Compose Generation
+echo "[6/7] Testing lightweight optional features & outbound proxy routing..."
+rm -f "$TEST_TEMP/domains.tsv"
+"$STACK_SCRIPT" --dir "$TEST_TEMP" features dashboard off >/dev/null
+"$STACK_SCRIPT" --dir "$TEST_TEMP" features api off >/dev/null
+"$STACK_SCRIPT" --dir "$TEST_TEMP" features caddy auto >/dev/null
+"$STACK_SCRIPT" --dir "$TEST_TEMP" features memory 192 >/dev/null
+
+# Trigger compose generation via proxy enable
+"$STACK_SCRIPT" --dir "$TEST_TEMP" proxy enable >/dev/null 2>&1 || true
+
+python3 -c "
+with open('$TEST_TEMP/docker-compose.yml', 'r') as f:
+    dc = f.read()
+assert 'HERMES_DASHBOARD=0' in dc, 'Dashboard should be disabled'
+assert 'API_SERVER_ENABLED=false' in dc, 'API server should be disabled'
+assert '127.0.0.1:9119:9119' not in dc, 'Port 9119 should not be mapped when dashboard is off'
+assert 'ai-stack-caddy' not in dc, 'Caddy should be omitted in auto mode when no domains exist'
+assert '--max-old-space-size=192' in dc, '9Router memory cap should be 192MB'
+assert 'ALL_PROXY=socks5h://xray:10808' in dc, 'Container ALL_PROXY should use socks5h://xray:10808'
+assert 'NODE_USE_ENV_PROXY=1' in dc, 'Node env proxy flag should be set'
+assert '127.0.0.1:10808:10808' in dc, 'Xray SOCKS5 should be exposed to localhost for host outbound traffic'
+"
+
+# Verify host proxy env & exec
+ENV_OUT=$("$STACK_SCRIPT" --dir "$TEST_TEMP" proxy env)
+echo "$ENV_OUT" | grep -q 'HTTP_PROXY="http://127.0.0.1:10809"'
+EXEC_OUT=$("$STACK_SCRIPT" --dir "$TEST_TEMP" proxy exec env)
+echo "$EXEC_OUT" | grep -q 'ALL_PROXY=socks5h://127.0.0.1:10808'
+echo "  Lightweight mode and host/container outbound proxy verified."
+
+# 7. Test Doctor
+echo "[7/7] Testing Doctor diagnostics..."
 STACK_DIR="$TEST_TEMP" "$STACK_SCRIPT" --dir "$TEST_TEMP" doctor >/dev/null
 echo "  Doctor diagnostics verified."
 
