@@ -86,16 +86,37 @@ The installer verifies prerequisites, downloads `manage.sh`, installs the `aista
 - **With Custom Domain**: `https://<your-domain>/v1`
 - **Default API Key**: `sk_9router` (or custom keys created in 9Router Admin UI)
 
-### Hermes Agent (Manual Setup)
+### Hermes Agent
 
-Run Hermes Agent natively on your host machine or laptop connected to 9Router:
+You can run Hermes Agent either via Docker or natively on your host machine:
+
+#### Option A: Docker (Self-Contained)
+Use the included standalone manager script (`scripts/hermes-docker.sh`):
+
+```bash
+# 1. Install global shortcut
+./scripts/hermes-docker.sh shortcut
+
+# 2. Configure model and point to 9Router
+hermes-docker gateway "http://127.0.0.1:20128/v1" "sk_9router"
+hermes-docker model "gpt-4o"
+
+# 3. Start background daemon (Web UI at :9119) & launch chat
+hermes-docker start
+hermes-docker chat
+```
+
+See [docs/HERMES_DOCKER.md](docs/HERMES_DOCKER.md) for complete details.
+
+#### Option B: Host Native Install
+Point a locally installed Hermes Agent CLI to 9Router:
 
 ```bash
 # 1. Point Hermes to 9Router
 hermes config set model.provider custom
 hermes config set model.base_url "http://127.0.0.1:20128/v1"
 hermes config set model.api_key "sk_9router"
-hermes config set model.default "gpt-4o"  # Or your configured model
+hermes config set model.default "gpt-4o"
 
 # 2. Start chatting with Hermes
 hermes chat
@@ -199,6 +220,7 @@ NineStack routes all domains directly to 9Router, serving both the Web Admin UI 
 Full guides and technical specifications are available in the [docs/](docs/README.md) directory:
 
 - [System Architecture](docs/ARCHITECTURE.md)
+- [Standalone Hermes Agent in Docker](docs/HERMES_DOCKER.md)
 - [Iran VPS & Network Resilience Guide](docs/IRAN_VPS_GUIDE.md)
 - [Proxy & Xray Balancer Configuration](docs/PROXY_AND_XRAY.md)
 
