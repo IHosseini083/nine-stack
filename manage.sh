@@ -49,14 +49,301 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# Logging Helpers
+# Logging & Smart TUI Engine (Zero external dependencies, flicker-free ANSI)
 # ------------------------------------------------------------------------------
 log()     { printf "%b\n" "$*"; }
-info()    { printf "%b[INFO]%b %s\n" "$C_CYAN" "$C_RESET" "$*"; }
-success() { printf "%b[OK]%b %s\n" "$C_GREEN" "$C_RESET" "$*"; }
-warn()    { printf "%b[WARN]%b %s\n" "$C_YELLOW" "$C_RESET" "$*" >&2; }
-err()     { printf "%b[ERROR]%b %s\n" "$C_RED" "$C_RESET" "$*" >&2; }
+info()    { printf "%b  ℹ %b%s\n" "$C_CYAN" "$C_RESET" "$*"; }
+success() { printf "%b  ✔ %b%s\n" "$C_GREEN" "$C_RESET" "$*"; }
+warn()    { printf "%b  ⚠ %b%s\n" "$C_YELLOW" "$C_RESET" "$*" >&2; }
+err()     { printf "%b  ✖ %b%s\n" "$C_RED" "$C_RESET" "$*" >&2; }
 die()     { err "$*"; exit 1; }
+
+TUI_CHOICE=0
+
+has_tty() {
+    { true </dev/tty; } 2>/dev/null
+}
+
+is_interactive_tty() {
+    [[ "${NO_TUI:-0}" != "1" ]] && [[ -t 1 ]] && has_tty
+}
+
+# Read a line from /dev/tty if available, fallback to stdin
+tty_read() {
+    if has_tty; then
+        read "$@" </dev/tty
+    else
+        read "$@"
+    fi
+}
+
+# Styled input prompt: tui_input "Prompt label" "default_value" result_var_name
+tui_input() {
+    local label="$1"
+    local default_val="${2:-}"
+    local __outvar="${3:-}"
+    local val=""
+    if [[ -n "$default_val" ]]; then
+        printf "  %b▸%b %b%s%b %b[%s]%b: " "$C_CYAN" "$C_RESET" "$C_BOLD" "$label" "$C_RESET" "$C_DIM" "$default_val" "$C_RESET"
+    else
+        printf "  %b▸%b %b%s%b: " "$C_CYAN" "$C_RESET" "$C_BOLD" "$label" "$C_RESET"
+    fi
+    tty_read -r val || val=""
+    val="${val:-$default_val}"
+    if [[ -n "$__outvar" ]]; then
+        printf -v "$__outvar" "%s" "$val"
+    else
+        printf "%s\n" "$val"
+    fi
+}
+
+# Interactive Yes/No confirmation: tui_confirm "Question?" [default_y_or_n]
+tui_confirm() {
+    local question="$1"
+    local default_ans="${2:-y}"
+    if [[ "${ASSUME_YES:-false}" == "true" ]]; then
+        return 0
+    fi
+    if is_interactive_tty; then
+        local pre=0
+        [[ "$default_ans" =~ ^[Nn] ]] && pre=1
+        TUI_DEFAULT_INDEX="$pre" tui_select "$question" "Yes, proceed" "No, cancel" || return 1
+        [[ "$TUI_CHOICE" -eq 0 ]]
+        return $?
+    else
+        local hint="[Y/n]"
+        [[ "$default_ans" =~ ^[Nn] ]] && hint="[y/N]"
+        local ans=""
+        printf "  %b?%b %s %s: " "$C_YELLOW" "$C_RESET" "$question" "$hint"
+        tty_read -r ans || ans="$default_ans"
+        ans="${ans:-$default_ans}"
+        [[ "$ans" =~ ^[Yy] ]]
+    fi
+}
+
+# Flicker-free arrow-key selector: tui_select "Title" "Opt 1" "Opt 2" ...
+# Sets global TUI_CHOICE (0-based index). Returns 0 on selection, 1 on q/Esc.
+tui_select() {
+    local title="$1"
+    shift
+    local options=("$@")
+    local count=${#options[@]}
+    local cur="${TUI_DEFAULT_INDEX:-0}"
+    TUI_DEFAULT_INDEX=0
+    (( cur >= count || cur < 0 )) && cur=0
+
+    if ! is_interactive_tty; then
+        printf "\n  %b%s%b\n" "$C_BOLD" "$title" "$C_RESET"
+        local i=0
+        for ((i=0; i<count; i++)); do
+            printf "    %d) %s\n" $((i+1)) "${options[$i]}"
+        done
+        local ans=""
+        tty_read -r -p "  Select [1-${count}] (default $((cur+1))): " ans || ans=""
+        if [[ "$ans" == "q" || "$ans" == "Q" || "$ans" == "0" ]]; then
+            return 1
+        fi
+        if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= count )); then
+            TUI_CHOICE=$((ans - 1))
+        else
+            TUI_CHOICE=$cur
+        fi
+        return 0
+    fi
+
+    printf "\n  %b▸ %s%b %b(↑/↓ move, Enter select, 1-%d quick-pick, q back)%b\n" \
+        "$C_BOLD$C_CYAN" "$title" "$C_RESET" "$C_DIM" "$count" "$C_RESET"
+
+    # Hide cursor during selection
+    printf "\033[?25l" >/dev/tty 2>/dev/null || true
+
+    local i
+    for ((i=0; i<count; i++)); do
+        printf "\n"
+    done
+
+    while true; do
+        # Move up $count lines and redraw options in-place
+        printf "\033[%dA" "$count"
+        for ((i=0; i<count; i++)); do
+            local num=$((i + 1))
+            if (( i == cur )); then
+                printf "\r\033[2K  %b❯ [%d] %s%b\n" "$C_BOLD$C_GREEN" "$num" "${options[$i]}" "$C_RESET"
+            else
+                printf "\r\033[2K    %b[%d]%b %s\n" "$C_DIM" "$num" "$C_RESET" "${options[$i]}"
+            fi
+        done
+
+        local key=""
+        IFS= read -rsn1 key </dev/tty || { printf "\033[?25h" >/dev/tty 2>/dev/null || true; return 1; }
+
+        if [[ "$key" == $'\x1b' ]]; then
+            local seq=""
+            IFS= read -rsn2 -t 0.05 seq </dev/tty || seq=""
+            case "$seq" in
+                "[A"|"OA") cur=$(( (cur - 1 + count) % count )) ;;
+                "[B"|"OB") cur=$(( (cur + 1) % count )) ;;
+                "")
+                    printf "\033[?25h" >/dev/tty 2>/dev/null || true
+                    return 1
+                    ;;
+            esac
+        elif [[ "$key" == "" ]]; then
+            printf "\033[?25h" >/dev/tty 2>/dev/null || true
+            TUI_CHOICE=$cur
+            return 0
+        elif [[ "$key" == "k" || "$key" == "K" ]]; then
+            cur=$(( (cur - 1 + count) % count ))
+        elif [[ "$key" == "j" || "$key" == "J" ]]; then
+            cur=$(( (cur + 1) % count ))
+        elif [[ "$key" == "q" || "$key" == "Q" ]]; then
+            printf "\033[?25h" >/dev/tty 2>/dev/null || true
+            return 1
+        elif [[ "$key" =~ ^[1-9]$ ]]; then
+            local idx=$((key - 1))
+            if (( idx < count )); then
+                cur=$idx
+                # Immediately redraw highlighted choice and return if <= 9 items
+                if (( count <= 9 )); then
+                    printf "\033[%dA" "$count"
+                    for ((i=0; i<count; i++)); do
+                        local num=$((i + 1))
+                        if (( i == cur )); then
+                            printf "\r\033[2K  %b❯ [%d] %s%b\n" "$C_BOLD$C_GREEN" "$num" "${options[$i]}" "$C_RESET"
+                        else
+                            printf "\r\033[2K    %b[%d]%b %s\n" "$C_DIM" "$num" "$C_RESET" "${options[$i]}"
+                        fi
+                    done
+                    printf "\033[?25h" >/dev/tty 2>/dev/null || true
+                    TUI_CHOICE=$cur
+                    return 0
+                fi
+            fi
+        fi
+    done
+}
+
+tui_pause() {
+    if is_interactive_tty; then
+        printf "\n  %bPress Enter or any key to continue...%b" "$C_DIM" "$C_RESET"
+        local _k=""
+        IFS= read -rsn1 _k </dev/tty || true
+        printf "\r\033[2K"
+    fi
+}
+
+# Run a command with an animated braille spinner when in an interactive TTY
+tui_spin() {
+    local msg="$1"
+    shift
+    if ! is_interactive_tty; then
+        info "$msg"
+        "$@"
+        return $?
+    fi
+
+    local log_tmp
+    log_tmp="$(mktemp -p /tmp ai-spin-XXXXXX)"
+    "$@" >"$log_tmp" 2>&1 &
+    local pid=$!
+    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local f=0
+
+    printf "\033[?25l" >/dev/tty 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r\033[2K  %b%s%b %s" "$C_CYAN" "${frames[$f]}" "$C_RESET" "$msg"
+        f=$(( (f + 1) % 10 ))
+        sleep 0.08
+    done
+
+    local rc=0
+    wait "$pid" || rc=$?
+    printf "\r\033[2K\033[?25h" >/dev/tty 2>/dev/null || true
+
+    if (( rc == 0 )); then
+        success "$msg"
+    else
+        err "$msg (failed with exit code $rc)"
+        cat "$log_tmp" >&2
+    fi
+    rm -f "$log_tmp"
+    return $rc
+}
+
+# Render live compact header for the interactive TUI
+tui_header() {
+    init_paths
+    ensure_stack_secrets
+
+    # Fast single-call container check
+    local running_names=""
+    if command -v docker >/dev/null 2>&1; then
+        running_names=$(docker ps --format '{{.Names}}' 2>/dev/null || true)
+    fi
+
+    local b_router="${C_DIM}○ 9Router${C_RESET}"
+    local b_hermes="${C_DIM}○ Hermes${C_RESET}"
+    local b_caddy="${C_DIM}○ Caddy${C_RESET}"
+    local b_xray="${C_DIM}○ Xray${C_RESET}"
+
+    grep -q "^ai-stack-nine-router$" <<<"$running_names" && b_router="${C_GREEN}● 9Router${C_RESET}"
+    grep -q "^ai-stack-hermes$" <<<"$running_names"      && b_hermes="${C_GREEN}● Hermes${C_RESET}"
+    grep -q "^ai-stack-caddy$" <<<"$running_names"       && b_caddy="${C_GREEN}● Caddy${C_RESET}"
+    grep -q "^ai-stack-xray$" <<<"$running_names"        && b_xray="${C_GREEN}● Xray${C_RESET}"
+
+    # Fast RAM reading from /proc/meminfo
+    local mem_str="N/A"
+    if [[ -r /proc/meminfo ]]; then
+        mem_str=$(awk '/MemTotal:/ {t=$2} /MemAvailable:/ {a=$2} END {if(t>0) printf "%dM / %dM (%d%%)", (t-a)/1024, t/1024, ((t-a)*100)/t}' /proc/meminfo 2>/dev/null || echo "N/A")
+    fi
+
+    local profile
+    profile=$(env_get "STACK_PROFILE" "auto")
+    local prx_en
+    prx_en=$(env_get "PROXY_ENABLED" "false")
+    local prx_mode
+    prx_mode=$(env_get "PROXY_MODE" "none")
+    local prx_badge="${C_DIM}Direct (Off)${C_RESET}"
+    if [[ "$prx_en" == "true" ]]; then
+        if [[ "$prx_mode" == "xray" ]]; then
+            local ncnt=0
+            [[ -f "$STACK_DIR/xray/links.txt" ]] && ncnt=$(grep -cve '^\s*$' "$STACK_DIR/xray/links.txt" 2>/dev/null || echo 0)
+            prx_badge="${C_GREEN}Xray (${ncnt} nodes)${C_RESET}"
+        elif [[ "$prx_mode" == "external" ]]; then
+            prx_badge="${C_GREEN}External Proxy${C_RESET}"
+        fi
+    fi
+
+    local dash_en
+    dash_en=$(env_get "HERMES_DASHBOARD_ENABLED" "true")
+    local api_en
+    api_en=$(env_get "HERMES_API_ENABLED" "true")
+    local caddy_en
+    caddy_en=$(env_get "CADDY_ENABLED" "auto")
+    local r_mem
+    r_mem=$(env_get "NINE_ROUTER_MAX_MEM" "256")
+
+    local dom_cnt=0
+    [[ -f "$STACK_DIR/domains.tsv" ]] && dom_cnt=$(grep -cve '^\s*$' "$STACK_DIR/domains.tsv" 2>/dev/null || echo 0)
+
+    local dash_pill="${C_GREEN}ON${C_RESET}"
+    [[ "$dash_en" != "true" ]] && dash_pill="${C_YELLOW}OFF (Light)${C_RESET}"
+    local api_pill="${C_GREEN}ON${C_RESET}"
+    [[ "$api_en" != "true" ]] && api_pill="${C_YELLOW}OFF${C_RESET}"
+
+    printf "\n"
+    printf "  %b╭──────────────────────────────────────────────────────────────────────╮%b\n" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b  %b⚡ HERMES STACK MANAGER v%-8s%b   %bRAM:%b %-26s %b│%b\n" \
+        "$C_CYAN" "$C_RESET" "$C_BOLD$C_WHITE" "$VERSION" "$C_RESET" "$C_DIM" "$C_RESET" "$mem_str" "$C_CYAN" "$C_RESET"
+    printf "  %b├──────────────────────────────────────────────────────────────────────┤%b\n" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b  %bServices:%b  %b   %b   %b   %b\n" \
+        "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$b_router" "$b_hermes" "$b_caddy" "$b_xray"
+    printf "  %b│%b  %bNetwork:%b   Profile: %b%-6s%b │ Proxy: %b │ Domains: %b%d%b\n" \
+        "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$profile" "$C_RESET" "$prx_badge" "$C_BOLD" "$dom_cnt" "$C_RESET"
+    printf "  %b│%b  %bFeatures:%b  WebUI: %b │ API: %b │ Caddy: %b%s%b │ Heap: %b%sM%b\n" \
+        "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$dash_pill" "$api_pill" "$C_CYAN" "$caddy_en" "$C_RESET" "$C_CYAN" "$r_mem" "$C_RESET"
+    printf "  %b╰──────────────────────────────────────────────────────────────────────╯%b\n" "$C_CYAN" "$C_RESET"
+}
 
 # ------------------------------------------------------------------------------
 # Mutual Exclusion (Flock)
@@ -69,8 +356,10 @@ acquire_lock() {
             die "Another instance of $SCRIPT_NAME is currently running."
         fi
     else
-        info "Waiting for stack lock..."
-        flock "$LOCK_FD"
+        if ! flock -n "$LOCK_FD"; then
+            info "Waiting for stack lock..."
+            flock "$LOCK_FD"
+        fi
     fi
 }
 
@@ -82,6 +371,7 @@ release_lock() {
 
 cleanup() {
     local exit_code=$?
+    { printf "\033[?25h" >/dev/tty; } 2>/dev/null || true
     release_lock
     exit "$exit_code"
 }
@@ -680,7 +970,7 @@ proxy_status() {
 proxy_set_external() {
     local url="${1:-}"
     if [[ -z "$url" ]]; then
-        read -r -p "Enter proxy URL (e.g. socks5://127.0.0.1:1080 or http://10.0.0.1:8080): " url
+        tui_input "External proxy URL (e.g. socks5://127.0.0.1:1080 or http://10.0.0.1:8080)" "$(env_get "PROXY_URL" "")" url
     fi
     if [[ -z "$url" ]]; then
         warn "No proxy URL provided."
@@ -696,7 +986,7 @@ proxy_set_external() {
 proxy_add_link() {
     local link="${1:-}"
     if [[ -z "$link" ]]; then
-        read -r -p "Paste share link (vless://, vmess://, trojan://, ss://): " link
+        tui_input "Paste Xray share link (vless://, vmess://, trojan://, ss://)" "" link
     fi
     link=$(printf "%s" "$link" | tr -d '\r\n ')
     if [[ -z "$link" ]]; then
@@ -1161,17 +1451,19 @@ domain_add() {
     local tls_mode="${3:-}"
     
     if [[ -z "$domain" ]]; then
-        read -r -p "Domain name (e.g. ai.example.com): " domain
+        tui_input "Domain name (e.g. ai.example.com)" "" domain
     fi
     domain=$(printf "%s" "$domain" | tr '[:upper:]' '[:lower:]' | tr -d ' /')
     
     if [[ -z "$domain" ]]; then
-        die "Domain name cannot be empty."
+        warn "Domain name cannot be empty."
+        return 1
     fi
     
     # Check if domain already exists
     if grep -q "^${domain}[[:space:]]" "$STACK_DIR/domains.tsv" 2>/dev/null; then
-        die "Domain $domain is already configured."
+        warn "Domain $domain is already configured."
+        return 1
     fi
     
     # Inspect CDN
@@ -1180,30 +1472,30 @@ domain_add() {
     info "Detected DNS/CDN provider: $cdn"
     
     if [[ -z "$service" ]]; then
-        printf "\nSelect service to expose on %s:\n" "$domain"
-        printf "  1) 9Router (OpenAI-compatible AI Proxy)\n"
-        printf "  2) Hermes Agent (Dashboard & API)\n"
-        printf "  3) Both (Routes /v1 and /api to 9Router, root to Hermes)\n"
-        read -r -p "Choice [1-3] (default 1): " s_choice
-        case "${s_choice:-1}" in
-            2) service="hermes" ;;
-            3) service="both" ;;
+        tui_select "Select service to expose on $domain" \
+            "9Router      — OpenAI-compatible AI Gateway & Admin UI" \
+            "Hermes Agent — Autonomous Agent Web Portal & API" \
+            "Both         — Routes /v1 & /api to 9Router, root / to Hermes" || return 1
+        case "$TUI_CHOICE" in
+            1) service="hermes" ;;
+            2) service="both" ;;
             *) service="9router" ;;
         esac
     fi
     
     if [[ -z "$tls_mode" ]]; then
-        printf "\nSelect TLS Mode:\n"
-        printf "  1) Auto (Let's Encrypt / ZeroSSL DV ACME)\n"
-        printf "  2) Origin Certificate (Cloudflare / ArvanCloud full SSL)\n"
-        printf "  3) Internal (Self-signed / local / Tailscale)\n"
+        local pre_tls=0
         if [[ "$cdn" == "Cloudflare" ]] || [[ "$cdn" == "ArvanCloud" ]]; then
-            info "Note: CDN detected. Origin Certificate (2) is recommended."
+            info "CDN ($cdn) detected: Origin Certificate is recommended for Full (Strict) SSL."
+            pre_tls=1
         fi
-        read -r -p "Choice [1-3] (default 1): " t_choice
-        case "${t_choice:-1}" in
-            2) tls_mode="origin" ;;
-            3) tls_mode="internal" ;;
+        TUI_DEFAULT_INDEX="$pre_tls" tui_select "Select SSL/TLS Mode for $domain" \
+            "Auto TLS           — Let's Encrypt / ZeroSSL DV ACME" \
+            "Origin Certificate — Paste Cloudflare / ArvanCloud Origin PEM" \
+            "Internal TLS       — Self-signed (Local / Tailscale)" || return 1
+        case "$TUI_CHOICE" in
+            1) tls_mode="origin" ;;
+            2) tls_mode="internal" ;;
             *) tls_mode="auto" ;;
         esac
     fi
@@ -1217,17 +1509,17 @@ domain_add() {
         cert_file="$cert_dir/cert.pem"
         key_file="$cert_dir/key.pem"
         
-        printf "\nPaste Origin Certificate for %s (end with empty line or Ctrl+D):\n" "$domain"
+        printf "\n  %b▸ Paste Origin Certificate for %s (end with empty line):%b\n" "$C_BOLD" "$domain" "$C_RESET"
         local cert_content=""
-        while IFS= read -r line; do
+        while IFS= tty_read -r line; do
             [[ -z "$line" && "$cert_content" =~ -----END[[:space:]]CERTIFICATE----- ]] && break
             cert_content+="$line"$'\n'
         done
         printf "%s" "$cert_content" > "$cert_file"
         
-        printf "\nPaste Origin Private Key for %s:\n" "$domain"
+        printf "\n  %b▸ Paste Origin Private Key for %s (end with empty line):%b\n" "$C_BOLD" "$domain" "$C_RESET"
         local key_content=""
-        while IFS= read -r line; do
+        while IFS= tty_read -r line; do
             [[ -z "$line" && "$key_content" =~ -----END[[:space:]]PRIVATE[[:space:]]KEY----- ]] && break
             key_content+="$line"$'\n'
         done
@@ -1256,7 +1548,7 @@ domain_add() {
     else
         caddy_reload
     fi
-    success "Domain $domain configured successfully."
+    success "Domain $domain configured ($service, TLS: $tls_mode)."
 }
 
 # Remove a domain
@@ -1264,8 +1556,17 @@ domain_rm() {
     init_paths
     local domain="${1:-}"
     if [[ -z "$domain" ]]; then
-        domain_list
-        read -r -p "Enter domain to remove: " domain
+        local dom_list=()
+        while IFS=$'\t' read -r dom srv tls _ || [[ -n "$dom" ]]; do
+            [[ -z "$dom" || "$dom" =~ ^# ]] && continue
+            dom_list+=("$dom ($srv, $tls)")
+        done < "$STACK_DIR/domains.tsv"
+        if [[ ${#dom_list[@]} -eq 0 ]]; then
+            warn "No domains configured to remove."
+            return 0
+        fi
+        tui_select "Select domain to remove" "${dom_list[@]}" || return 0
+        domain="${dom_list[$TUI_CHOICE]%% *}"
     fi
     domain=$(printf "%s" "$domain" | tr '[:upper:]' '[:lower:]' | tr -d ' /')
     
@@ -1277,6 +1578,7 @@ domain_rm() {
     sed -i "/^${domain}[[:space:]]/d" "$STACK_DIR/domains.tsv"
     rm -rf "$STACK_DIR/certs/$domain"
     generate_caddyfile
+    generate_docker_compose
     caddy_reload
     success "Domain $domain removed."
 }
@@ -2122,101 +2424,142 @@ stack_setup() {
     init_paths
     ensure_stack_secrets
     
-    printf "\n%b================ AI STACK INITIAL SETUP ================%b\n" "$C_BOLD" "$C_RESET"
-    info "Setting up AI Stack at $STACK_DIR..."
+    printf "\n"
+    printf "  %b╭──────────────────────────────────────────────────────────────────────╮%b\n" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b  %b🚀 HERMES STACK SMART SETUP WIZARD%b                                 %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD$C_WHITE" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b  %bDirectory:%b %-56s %b│%b\n" "$C_CYAN" "$C_RESET" "$C_DIM" "$C_RESET" "$STACK_DIR" "$C_CYAN" "$C_RESET"
+    printf "  %b╰──────────────────────────────────────────────────────────────────────╯%b\n" "$C_CYAN" "$C_RESET"
     
-    # 1. Profile selection
+    # Step 1: Profile selection
     local detected_profile="intl"
+    local pre_prof=1
     if detect_iran_network; then
         detected_profile="iran"
+        pre_prof=0
     fi
     
-    printf "\nSelect Deployment Environment:\n"
-    printf "  1) Iran VPS (Docker mirrors, proxy routing, DNS poisoning mitigation) %s\n" "$([[ "$detected_profile" == "iran" ]] && printf "(Detected)" || printf "")"
-    printf "  2) International VPS (Direct access to Docker Hub and AI APIs) %s\n" "$([[ "$detected_profile" == "intl" ]] && printf "(Detected)" || printf "")"
-    read -r -p "Choice [1-2] (default $([[ "$detected_profile" == "iran" ]] && echo "1" || echo "2")): " prof_choice
+    local iran_tag=""
+    local intl_tag=""
+    [[ "$detected_profile" == "iran" ]] && iran_tag=" (Auto-Detected)" || intl_tag=" (Auto-Detected)"
     
-    if [[ "${prof_choice:-}" == "1" ]] || { [[ -z "$prof_choice" ]] && [[ "$detected_profile" == "iran" ]]; }; then
+    TUI_DEFAULT_INDEX="$pre_prof" tui_select "Step 1/5 — Select Server Network Environment" \
+        "Iran VPS          — Anti-censorship, Docker mirrors, DNS poisoning shield${iran_tag}" \
+        "International VPS — Direct connection to Docker Hub & AI APIs${intl_tag}" || return 1
+    
+    if [[ "$TUI_CHOICE" -eq 0 ]]; then
         env_set "STACK_PROFILE" "iran"
-        info "Configured for Iran environment."
+        success "Environment set to: Iran VPS"
         
-        # Configure Docker mirrors if root
         if [[ "$(id -u)" -eq 0 ]]; then
-            read -r -p "Configure Iranian Docker registry mirrors now? [Y/n]: " setup_mirr
-            if [[ "${setup_mirr:-y}" =~ ^[Yy]$ ]]; then
+            if tui_confirm "Benchmark & configure Iranian Docker registry mirrors now?" "y"; then
                 configure_docker_mirrors || true
             fi
         fi
         
-        # Configure Proxy
-        read -r -p "Configure Outbound Proxy / Xray now? [Y/n]: " setup_prx
-        if [[ "${setup_prx:-y}" =~ ^[Yy]$ ]]; then
-            printf "\nProxy Types:\n"
-            printf "  1) Import Xray Share Link (vless://, vmess://, trojan://, ss://)\n"
-            printf "  2) External SOCKS5 / HTTP Proxy URL\n"
-            read -r -p "Choice [1-2]: " prx_choice
-            if [[ "$prx_choice" == "2" ]]; then
-                proxy_set_external ""
-            else
-                proxy_add_link ""
-            fi
-        fi
+        tui_select "Configure Outbound Proxy for AI & External Traffic" \
+            "Import Xray Share Link (vless://, vmess://, trojan://, ss://)" \
+            "Use External Proxy URL (socks5:// or http://)" \
+            "Skip proxy setup for now" || true
+        case "$TUI_CHOICE" in
+            0)
+                while true; do
+                    proxy_add_link "" || true
+                    if ! tui_confirm "Add another Xray node to the leastPing balancer?" "n"; then
+                        break
+                    fi
+                done
+                ;;
+            1)
+                proxy_set_external "" || true
+                ;;
+            *)
+                info "Skipped proxy setup (you can configure it anytime via 'aistack proxy')."
+                ;;
+        esac
     else
         env_set "STACK_PROFILE" "intl"
-        info "Configured for International environment."
+        success "Environment set to: International VPS"
     fi
     
-    # 2. 9Router Initial Password
-    printf "\n%b9Router Admin Password:%b\n" "$C_BOLD" "$C_RESET"
+    # Step 2: Resource & Feature Profile
+    tui_select "Step 2/5 — Select Resource & Feature Profile" \
+        "Standard Mode    — 9Router + Hermes Agent + Hermes Web UI & API (Recommended)" \
+        "Lightweight Mode — Disable Hermes Web UI (Port 9119) to save RAM" \
+        "Ultra-Light Mode — Headless Agent only (No Hermes Web UI or API, 192MB heap cap)" || return 1
+    
+    case "$TUI_CHOICE" in
+        1)
+            env_set "HERMES_DASHBOARD_ENABLED" "false"
+            env_set "HERMES_API_ENABLED" "true"
+            env_set "NINE_ROUTER_MAX_MEM" "256"
+            success "Profile: Lightweight Mode (Hermes Web UI disabled)."
+            ;;
+        2)
+            env_set "HERMES_DASHBOARD_ENABLED" "false"
+            env_set "HERMES_API_ENABLED" "false"
+            env_set "NINE_ROUTER_MAX_MEM" "192"
+            success "Profile: Ultra-Light Mode (Hermes Web UI & API disabled, 192MB heap cap)."
+            ;;
+        *)
+            env_set "HERMES_DASHBOARD_ENABLED" "true"
+            env_set "HERMES_API_ENABLED" "true"
+            env_set "NINE_ROUTER_MAX_MEM" "256"
+            success "Profile: Standard Mode."
+            ;;
+    esac
+    
+    # Step 3: Credentials & AI Model
+    printf "\n  %b▸ Step 3/5 — Credentials & Default AI Model%b\n" "$C_BOLD$C_CYAN" "$C_RESET"
     local cur_pass
     cur_pass=$(env_get "INITIAL_PASSWORD" "123456")
-    read -r -p "Set initial password (default: $cur_pass): " in_pass
-    if [[ -n "$in_pass" ]]; then
-        env_set "INITIAL_PASSWORD" "$in_pass"
-    fi
+    local in_pass=""
+    tui_input "9Router Admin Password" "$cur_pass" in_pass
+    env_set "INITIAL_PASSWORD" "$in_pass"
     
-    # 3. Hermes Optional Web UI & Credentials
-    printf "\n%bHermes Agent Web UI (Optional):%b\n" "$C_BOLD" "$C_RESET"
-    read -r -p "Enable Hermes Web UI Dashboard on port 9119? (Disable to save RAM) [Y/n]: " enable_dash
-    if [[ "${enable_dash:-y}" =~ ^[Nn]$ ]]; then
-        env_set "HERMES_DASHBOARD_ENABLED" "false"
-        info "Hermes Web UI disabled (lightweight mode)."
-    else
-        env_set "HERMES_DASHBOARD_ENABLED" "true"
+    if [[ "$(env_get "HERMES_DASHBOARD_ENABLED" "true")" == "true" ]]; then
         local cur_huser
         cur_huser=$(env_get "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "admin")
-        read -r -p "Dashboard username (default: $cur_huser): " in_huser
-        env_set "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "${in_huser:-$cur_huser}"
+        local in_huser=""
+        tui_input "Hermes Web UI Username" "$cur_huser" in_huser
+        env_set "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "$in_huser"
         
         local cur_hpass
         cur_hpass=$(env_get "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "admin123")
-        read -r -p "Dashboard password (default: $cur_hpass): " in_hpass
-        env_set "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "${in_hpass:-$cur_hpass}"
+        local in_hpass=""
+        tui_input "Hermes Web UI Password" "$cur_hpass" in_hpass
+        env_set "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "$in_hpass"
     fi
     
-    # 4. Default AI Model
-    printf "\n%bDefault AI Model:%b\n" "$C_BOLD" "$C_RESET"
     local cur_model
     cur_model=$(env_get "DEFAULT_MODEL" "nousresearch/hermes-3-llama-3.1-8b")
-    read -r -p "Model name (default: $cur_model): " in_model
-    local final_model="${in_model:-$cur_model}"
+    local final_model=""
+    tui_input "Default AI Model" "$cur_model" final_model
     env_set "DEFAULT_MODEL" "$final_model"
-    
-    # Update Hermes config.yaml
     merge_hermes_config "$final_model" "$(env_get "INITIAL_PASSWORD" "123456")" "localhost"
     
-    # 5. Domain Configuration
-    read -r -p "Would you like to configure a domain name now? [y/N]: " setup_dom
-    if [[ "$setup_dom" =~ ^[Yy]$ ]]; then
-        domain_add "" "" ""
+    # Step 4: Domain Configuration
+    if tui_confirm "Step 4/5 — Would you like to configure a custom domain & SSL now?" "n"; then
+        domain_add "" "" "" || true
     fi
     
-    # 6. Install shortcut
+    # Step 5: Install CLI shortcut & Start Stack
+    printf "\n  %b▸ Step 5/5 — Launching Stack Services%b\n" "$C_BOLD$C_CYAN" "$C_RESET"
     install_shortcut
-    
-    # 7. Start Stack
     stack_start
-    success "Setup completed successfully."
+    
+    printf "\n"
+    printf "  %b╭──────────────────────────────────────────────────────────────────────╮%b\n" "$C_GREEN" "$C_RESET"
+    printf "  %b│%b  %b✔ SETUP COMPLETED SUCCESSFULLY%b                                     %b│%b\n" "$C_GREEN" "$C_RESET" "$C_BOLD$C_GREEN" "$C_RESET" "$C_GREEN" "$C_RESET"
+    printf "  %b├──────────────────────────────────────────────────────────────────────┤%b\n" "$C_GREEN" "$C_RESET"
+    printf "  %b│%b  • %b9Router Admin:%b  http://localhost:20128/admin (Pass: %s)\n" "$C_GREEN" "$C_RESET" "$C_BOLD" "$C_RESET" "$(env_get "INITIAL_PASSWORD" "123456")"
+    if [[ "$(env_get "HERMES_DASHBOARD_ENABLED" "true")" == "true" ]]; then
+        printf "  %b│%b  • %bHermes Web UI:%b  http://localhost:9119 (User: %s / Pass: %s)\n" \
+            "$C_GREEN" "$C_RESET" "$C_BOLD" "$C_RESET" "$(env_get "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "admin")" "$(env_get "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "admin123")"
+    else
+        printf "  %b│%b  • %bHermes Web UI:%b  Disabled (Lightweight mode — toggle via 'aistack')\n" "$C_GREEN" "$C_RESET" "$C_BOLD" "$C_RESET"
+    fi
+    printf "  %b│%b  • %bManage Stack:%b   Run %baistack%b anytime to open the interactive TUI\n" "$C_GREEN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b╰──────────────────────────────────────────────────────────────────────╯%b\n" "$C_GREEN" "$C_RESET"
 }
 
 # Install 'aistack' CLI shortcut symlink
@@ -2277,79 +2620,275 @@ run_selftest() {
     success "All self-tests passed successfully."
 }
 
-# Interactive Menu Loop
-interactive_menu() {
+# Interactive Submenus & Main TUI Loop
+tui_menu_domains() {
     while true; do
-        printf "\n%b================ AI STACK MANAGER ================%b\n" "$C_BOLD" "$C_RESET"
-        printf "  1) Stack Status & Resources\n"
-        printf "  2) Initial Setup Wizard\n"
-        printf "  3) Start / Restart Stack\n"
-        printf "  4) Stop Stack\n"
-        printf "  5) Domain Management (Add / Remove / List)\n"
-        printf "  6) Proxy & Xray Management (Bypass Censorship)\n"
-        printf "  7) Run Diagnostic Doctor\n"
-        printf "  8) Backup & Restore (SQLite + SSL + Configs)\n"
-        printf "  9) Update Stack Images (With Auto-Rollback)\n"
-        printf " 10) View Container Logs\n"
-        printf " 11) Optional Features & Lightweight Mode\n"
-        printf "  0) Exit\n"
-        printf "%s\n" "--------------------------------------------------"
-        read -r -p "Select option [0-11]: " opt
-        
-        case "$opt" in
-            1) stack_status ;;
-            2) stack_setup ;;
-            3) stack_restart ;;
-            4) stack_stop ;;
-            5)
-                printf "\nDomain Menu:\n 1) List\n 2) Add\n 3) Remove\n"
-                read -r -p "Choice: " d_opt
-                case "$d_opt" in
-                    1) domain_list ;;
-                    2) domain_add "" "" "" ;;
-                    3) domain_rm "" ;;
-                esac
-                ;;
-            6)
-                printf "\nProxy Menu:\n 1) Status\n 2) Add Xray Share Link\n 3) Set External URL\n 4) Clear Links\n 5) Disable\n 6) Show Host Proxy Env Vars\n"
-                read -r -p "Choice: " p_opt
-                case "$p_opt" in
-                    1) proxy_status ;;
-                    2) proxy_add_link "" ;;
-                    3) proxy_set_external "" ;;
-                    4) proxy_clear_links ;;
-                    5) proxy_disable ;;
-                    6) proxy_env || true ;;
-                esac
-                ;;
-            7) stack_doctor ;;
-            8)
-                printf "\nBackup Menu:\n 1) Create Backup\n 2) List Backups\n 3) Restore Backup\n 4) Install Daily Cron\n"
-                read -r -p "Choice: " b_opt
-                case "$b_opt" in
-                    1) backup_create "manual" ;;
-                    2) backup_list ;;
-                    3) backup_restore "" ;;
-                    4) install_backup_cron ;;
-                esac
-                ;;
-            9) stack_update ;;
-            10) stack_logs "" ;;
-            11)
-                features_status
-                printf "\nFeatures Menu:\n 1) Toggle Hermes Web UI (on/off)\n 2) Toggle Hermes API Server (on/off)\n 3) Set Caddy Mode (auto/on/off)\n 4) Set 9Router Max Memory (MB)\n"
-                read -r -p "Choice: " f_opt
-                case "$f_opt" in
-                    1) read -r -p "Hermes Web UI [on/off]: " v; features_set dashboard "$v" ;;
-                    2) read -r -p "Hermes API [on/off]: " v; features_set api "$v" ;;
-                    3) read -r -p "Caddy Mode [auto/on/off]: " v; features_set caddy "$v" ;;
-                    4) read -r -p "9Router Max Memory MB [e.g. 256]: " v; features_set memory "$v" ;;
-                esac
-                ;;
-            0|q|Q) break ;;
-            *) warn "Invalid selection." ;;
+        domain_list
+        tui_select "Domain & SSL Management" \
+            "Add a Domain (Auto-TLS / Cloudflare & Arvan Origin / Internal)" \
+            "Remove an Existing Domain" \
+            "Sync & Reload Caddyfile" \
+            "Back to Main Menu" || break
+        case "$TUI_CHOICE" in
+            0) domain_add "" "" "" || true ;;
+            1) domain_rm "" || true ;;
+            2) generate_caddyfile; caddy_reload || true ;;
+            3) break ;;
         esac
     done
+}
+
+tui_menu_proxy() {
+    while true; do
+        printf "\n"
+        proxy_status
+        tui_select "Outbound Proxy & Xray Anti-Censorship" \
+            "Import Xray Share Link (vless://, vmess://, trojan://, ss://)" \
+            "Set External SOCKS5 / HTTP Proxy URL" \
+            "Enable Proxy Routing & Apply to Stack" \
+            "Disable Proxy Routing (Direct Connection)" \
+            "Clear All Imported Xray Links" \
+            "Show Host Shell Proxy Environment Variables" \
+            "Back to Main Menu" || break
+        case "$TUI_CHOICE" in
+            0)
+                if proxy_add_link ""; then
+                    if tui_confirm "Restart stack now to route traffic through updated Xray balancer?" "y"; then
+                        stack_restart
+                    fi
+                fi
+                ;;
+            1)
+                if proxy_set_external ""; then
+                    if tui_confirm "Restart stack now to apply external proxy?" "y"; then
+                        stack_restart
+                    fi
+                fi
+                ;;
+            2) proxy_enable && stack_restart ;;
+            3) proxy_disable && stack_restart ;;
+            4)
+                if tui_confirm "Clear all imported Xray share links?" "n"; then
+                    proxy_clear_links
+                fi
+                ;;
+            5)
+                printf "\n"
+                proxy_env || true
+                tui_pause
+                ;;
+            6) break ;;
+        esac
+    done
+}
+
+tui_menu_features() {
+    local dirty=0
+    while true; do
+        local d_en
+        d_en=$(env_get "HERMES_DASHBOARD_ENABLED" "true")
+        local a_en
+        a_en=$(env_get "HERMES_API_ENABLED" "true")
+        local c_en
+        c_en=$(env_get "CADDY_ENABLED" "auto")
+        local m_cap
+        m_cap=$(env_get "NINE_ROUTER_MAX_MEM" "256")
+
+        tui_select "Lightweight Mode & Optional Features (Press Enter to toggle)" \
+            "Hermes Web UI (Port 9119) : $([[ "$d_en" == "true" ]] && echo "ENABLED  → Press to Disable (Saves RAM)" || echo "DISABLED → Press to Enable")" \
+            "Hermes API (Port 8642)    : $([[ "$a_en" == "true" ]] && echo "ENABLED  → Press to Disable" || echo "DISABLED → Press to Enable")" \
+            "Caddy Reverse Proxy       : Mode [${c_en}] → Press to cycle (auto / on / off)" \
+            "9Router V8 Memory Cap     : ${m_cap} MB → Press to change (192 / 256 / 512 / Custom)" \
+            "Apply Changes & Restart Stack Now" \
+            "Back to Main Menu" || break
+
+        case "$TUI_CHOICE" in
+            0)
+                [[ "$d_en" == "true" ]] && features_set dashboard off || features_set dashboard on
+                dirty=1
+                ;;
+            1)
+                [[ "$a_en" == "true" ]] && features_set api off || features_set api on
+                dirty=1
+                ;;
+            2)
+                case "$c_en" in
+                    auto)  features_set caddy on ;;
+                    true)  features_set caddy off ;;
+                    *)     features_set caddy auto ;;
+                esac
+                dirty=1
+                ;;
+            3)
+                tui_select "Select 9Router V8 Max Memory Limit" \
+                    "192 MB (Ultra-Light 1GB VPS)" \
+                    "256 MB (Recommended Default)" \
+                    "512 MB (High Concurrency)" \
+                    "Custom MB Value" || continue
+                case "$TUI_CHOICE" in
+                    0) features_set memory 192 ;;
+                    1) features_set memory 256 ;;
+                    2) features_set memory 512 ;;
+                    3)
+                        local custom_m=""
+                        tui_input "Enter max memory in MB (min 128)" "$m_cap" custom_m
+                        features_set memory "$custom_m" || true
+                        ;;
+                esac
+                dirty=1
+                ;;
+            4)
+                stack_restart
+                dirty=0
+                ;;
+            5)
+                if (( dirty == 1 )); then
+                    if tui_confirm "Apply feature changes and restart stack now?" "y"; then
+                        stack_restart
+                    fi
+                fi
+                break
+                ;;
+        esac
+    done
+}
+
+tui_menu_backups() {
+    while true; do
+        backup_list
+        tui_select "Backup & Restore Manager" \
+            "Create New Full Backup Archive (SQLite + SSL + Config)" \
+            "Restore Stack from a Backup Archive" \
+            "Enable Daily Automated Backup Cron (03:00 AM)" \
+            "Back to Main Menu" || break
+        case "$TUI_CHOICE" in
+            0)
+                local tag=""
+                tui_input "Backup label" "manual" tag
+                backup_create "$tag"
+                tui_pause
+                ;;
+            1)
+                local b_files=()
+                local f
+                for f in "$STACK_DIR"/backups/backup-*.tar.gz; do
+                    [[ -f "$f" ]] && b_files+=("$(basename "$f") ($(du -h "$f" | cut -f1))")
+                done
+                if [[ ${#b_files[@]} -eq 0 ]]; then
+                    warn "No backup archives found in $STACK_DIR/backups."
+                else
+                    if tui_select "Select backup archive to restore" "${b_files[@]}"; then
+                        local chosen_file="$STACK_DIR/backups/${b_files[$TUI_CHOICE]%% *}"
+                        backup_restore "$chosen_file"
+                    fi
+                fi
+                ;;
+            2)
+                install_backup_cron
+                tui_pause
+                ;;
+            3) break ;;
+        esac
+    done
+}
+
+tui_menu_iran() {
+    while true; do
+        tui_select "Iran VPS Network Resilience Toolkit" \
+            "Detect Network Restrictions & DNS Poisoning" \
+            "Benchmark & Configure Iranian Docker Mirrors" \
+            "Tune Docker MTU (1400) to Prevent TLS Packet Drops" \
+            "Export Offline Container Image Bundle (.tar.gz)" \
+            "Import Offline Container Image Bundle (.tar.gz)" \
+            "Back to Main Menu" || break
+        case "$TUI_CHOICE" in
+            0)
+                if detect_iran_network; then
+                    warn "Host is affected by Iranian network restrictions or DNS poisoning."
+                else
+                    success "Host has direct international network connectivity."
+                fi
+                tui_pause
+                ;;
+            1) configure_docker_mirrors || true; tui_pause ;;
+            2)
+                local mtu_val=""
+                tui_input "Docker MTU value" "1400" mtu_val
+                configure_docker_mtu "$mtu_val" || true
+                tui_pause
+                ;;
+            3)
+                local exp_file=""
+                tui_input "Output bundle path" "$STACK_DIR/ai-stack-images.tar.gz" exp_file
+                bundle_export "$exp_file"
+                tui_pause
+                ;;
+            4)
+                local imp_file=""
+                tui_input "Path to bundle .tar.gz file" "$STACK_DIR/ai-stack-images.tar.gz" imp_file
+                bundle_import "$imp_file" || true
+                tui_pause
+                ;;
+            5) break ;;
+        esac
+    done
+}
+
+tui_menu_logs() {
+    tui_select "Select Service Logs to Stream (Press Ctrl+C to stop streaming)" \
+        "All Services" \
+        "9Router (AI Gateway)" \
+        "Hermes Agent" \
+        "Caddy Reverse Proxy" \
+        "Xray Proxy Balancer" \
+        "Back to Main Menu" || return 0
+    case "$TUI_CHOICE" in
+        0) stack_logs "" || true ;;
+        1) stack_logs "nine-router" || true ;;
+        2) stack_logs "hermes" || true ;;
+        3) stack_logs "caddy" || true ;;
+        4) stack_logs "xray" || true ;;
+        5) return 0 ;;
+    esac
+}
+
+interactive_menu() {
+    local last_choice=0
+    while true; do
+        tui_header
+        TUI_DEFAULT_INDEX="$last_choice" tui_select "Main Menu" \
+            "📊 Detailed Status, Endpoints & Credentials" \
+            "🪶 Lightweight Mode & Optional Features (Web UI / API / RAM)" \
+            "🛡️ Proxy & Xray Anti-Censorship (Share Links / Host Proxy)" \
+            "🌐 Domain & SSL Manager (Auto-TLS / Cloudflare / Arvan)" \
+            "⚡ Start / Restart Stack Services" \
+            "🛑 Stop Stack Services" \
+            "🩺 Run System & Outbound Network Doctor" \
+            "💾 Backup & Restore (SQLite + SSL + Configs)" \
+            "🇮🇷 Iran VPS Toolkit (Mirrors / MTU / Offline Bundles)" \
+            "🔄 Update Stack Images (With Auto-Rollback)" \
+            "📜 Stream Live Container Logs" \
+            "🚀 Re-run Initial Setup Wizard" \
+            "🚪 Exit" || break
+
+        last_choice=$TUI_CHOICE
+        case "$TUI_CHOICE" in
+            0) stack_status; tui_pause ;;
+            1) tui_menu_features ;;
+            2) tui_menu_proxy ;;
+            3) tui_menu_domains ;;
+            4) stack_restart; tui_pause ;;
+            5) stack_stop; tui_pause ;;
+            6) stack_doctor; tui_pause ;;
+            7) tui_menu_backups ;;
+            8) tui_menu_iran ;;
+            9) stack_update; tui_pause ;;
+            10) tui_menu_logs ;;
+            11) stack_setup; tui_pause ;;
+            12) break ;;
+        esac
+    done
+    printf "\n"
 }
 
 # ------------------------------------------------------------------------------
@@ -2459,7 +2998,7 @@ done
 
 # If no subcommand provided:
 if [[ $# -eq 0 ]]; then
-    if [[ -t 0 ]]; then
+    if [[ -t 0 ]] || is_interactive_tty; then
         interactive_menu
         exit 0
     else
@@ -2474,6 +3013,9 @@ shift
 acquire_lock false
 
 case "$CMD" in
+    menu|tui)
+        interactive_menu
+        ;;
     setup)
         stack_setup
         ;;

@@ -25,12 +25,16 @@ else
     C_RED=""
 fi
 
-info()    { printf "%b[INFO]%b %s\n" "$C_CYAN" "$C_RESET" "$*"; }
-success() { printf "%b[OK]%b %s\n" "$C_GREEN" "$C_RESET" "$*"; }
-warn()    { printf "%b[WARN]%b %s\n" "$C_YELLOW" "$C_RESET" "$*" >&2; }
-die()     { printf "%b[ERROR]%b %s\n" "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+info()    { printf "%b  ℹ %b%s\n" "$C_CYAN" "$C_RESET" "$*"; }
+success() { printf "%b  ✔ %b%s\n" "$C_GREEN" "$C_RESET" "$*"; }
+warn()    { printf "%b  ⚠ %b%s\n" "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()     { printf "%b  ✖ %b%s\n" "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
-printf "\n%b=== HermesStack Installer ===%b\n\n" "$C_BOLD" "$C_RESET"
+printf "\n"
+printf "  %b╭──────────────────────────────────────────────────────────────────────╮%b\n" "$C_CYAN" "$C_RESET"
+printf "  %b│%b  %b⚡ HERMES STACK INSTALLER%b                                           %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
+printf "  %b│%b  9Router • Hermes Agent • Caddy Auto-TLS • Xray Anti-Censorship      %b│%b\n" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
+printf "  %b╰──────────────────────────────────────────────────────────────────────╯%b\n\n" "$C_CYAN" "$C_RESET"
 
 # Check root or user
 if [[ "$(id -u)" -eq 0 ]]; then
@@ -76,7 +80,7 @@ fi
 if [[ -t 0 ]]; then
     info "Launching setup wizard..."
     exec "$BIN_DIR/aistack" setup
-elif [[ -t 1 ]] && [[ -e /dev/tty ]]; then
+elif [[ -t 1 ]] && { true </dev/tty; } 2>/dev/null; then
     info "Launching setup wizard..."
     exec "$BIN_DIR/aistack" setup </dev/tty
 else

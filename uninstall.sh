@@ -23,10 +23,10 @@ else
     C_RED=""
 fi
 
-info()    { printf "%b[INFO]%b %s\n" "$C_CYAN" "$C_RESET" "$*"; }
-success() { printf "%b[OK]%b %s\n" "$C_GREEN" "$C_RESET" "$*"; }
-warn()    { printf "%b[WARN]%b %s\n" "$C_YELLOW" "$C_RESET" "$*" >&2; }
-die()     { printf "%b[ERROR]%b %s\n" "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+info()    { printf "%b  ℹ %b%s\n" "$C_CYAN" "$C_RESET" "$*"; }
+success() { printf "%b  ✔ %b%s\n" "$C_GREEN" "$C_RESET" "$*"; }
+warn()    { printf "%b  ⚠ %b%s\n" "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()     { printf "%b  ✖ %b%s\n" "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
 PURGE=false
 ASSUME_YES=false
@@ -38,7 +38,10 @@ for arg in "$@"; do
     esac
 done
 
-printf "\n%b=== HermesStack Uninstaller ===%b\n\n" "$C_BOLD" "$C_RESET"
+printf "\n"
+printf "  %b╭──────────────────────────────────────────────────────────────────────╮%b\n" "$C_YELLOW" "$C_RESET"
+printf "  %b│%b  %b🗑️  HERMES STACK UNINSTALLER%b                                         %b│%b\n" "$C_YELLOW" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_YELLOW" "$C_RESET"
+printf "  %b╰──────────────────────────────────────────────────────────────────────╯%b\n\n" "$C_YELLOW" "$C_RESET"
 
 # Detect install locations
 TARGET_DIRS=("/opt/hermes-stack" "/opt/ai-stack" "${HOME}/.hermes-stack" "${HOME}/ai-stack")
@@ -58,7 +61,7 @@ if [[ "$ASSUME_YES" != "true" ]]; then
     if [[ "$PURGE" == "true" ]]; then
         printf "%bWARNING: --purge flag specified. All databases, certificates, and configs will be deleted!%b\n" "$C_RED" "$C_RESET"
     fi
-    if [[ -e /dev/tty ]]; then
+    if { true </dev/tty; } 2>/dev/null; then
         read -r -p "Do you want to proceed with uninstallation? [y/N]: " confirm </dev/tty || confirm="n"
         if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
             info "Uninstallation canceled."
