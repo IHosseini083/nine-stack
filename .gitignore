@@ -1,0 +1,32 @@
+# Stack runtime and state
+.env
+*.env.bak*
+domains.tsv
+Caddyfile
+docker-compose.yml
+docker-compose.override.yml
+
+# Storage and volumes
+certs/
+backups/
+state/
+hermes/
+Caddyfile.d/custom
+
+# Xray runtime generated files
+xray/config.json
+xray/links.txt
+
+# Backups and temporary files
+*.orig
+*.bak
+*.tar.gz
+*.lock
+*.log
+/tmp/
+
+# OS and Editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
