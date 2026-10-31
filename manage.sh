@@ -203,21 +203,18 @@ tui_select() {
             local idx=$((key - 1))
             if (( idx < count )); then
                 cur=$idx
-                # Immediately redraw highlighted choice and return if <= 9 items
-                if (( count <= 9 )); then
-                    printf "\033[%dA" "$count"
-                    for ((i=0; i<count; i++)); do
-                        local num=$((i + 1))
-                        if (( i == cur )); then
-                            printf "\r\033[2K  %b❯ [%d] %s%b\n" "$C_BOLD$C_GREEN" "$num" "${options[$i]}" "$C_RESET"
-                        else
-                            printf "\r\033[2K    %b[%d]%b %s\n" "$C_DIM" "$num" "$C_RESET" "${options[$i]}"
-                        fi
-                    done
-                    printf "\033[?25h" >/dev/tty 2>/dev/null || true
-                    TUI_CHOICE=$cur
-                    return 0
-                fi
+                printf "\033[%dA" "$count"
+                for ((i=0; i<count; i++)); do
+                    local num=$((i + 1))
+                    if (( i == cur )); then
+                        printf "\r\033[2K  %b❯ [%d] %s%b\n" "$C_BOLD$C_GREEN" "$num" "${options[$i]}" "$C_RESET"
+                    else
+                        printf "\r\033[2K    %b[%d]%b %s\n" "$C_DIM" "$num" "$C_RESET" "${options[$i]}"
+                    fi
+                done
+                printf "\033[?25h" >/dev/tty 2>/dev/null || true
+                TUI_CHOICE=$cur
+                return 0
             fi
         fi
     done
@@ -553,19 +550,34 @@ ensure_stack_secrets() {
 }
 
 # ------------------------------------------------------------------------------
-# Hermes config.yaml Merge Helper
+# Hermes config.yaml Merge & Access Subsystem
 # ------------------------------------------------------------------------------
 # Merges model and dashboard sections without clobbering existing configuration
+# Also auto-heals any line-concatenated top-level keys (e.g. api_key: ..._config_version: 51)
 merge_hermes_config() {
     local config_file="$STACK_DIR/hermes/config.yaml"
-    local model_name="$1"
-    local nine_router_key="$2"
-    local dashboard_domain="${3:-localhost}"
+    local model_name="${1:-$(env_get "DEFAULT_MODEL" "nousresearch/hermes-3-llama-3.1-8b")}"
+    local nine_router_key="${2:-$(env_get "INITIAL_PASSWORD" "123456")}"
+    local dashboard_domain="${3:-}"
     
     init_paths
     
+    if [[ -z "$dashboard_domain" ]]; then
+        dashboard_domain="localhost"
+        if [[ -s "$STACK_DIR/domains.tsv" ]]; then
+            local d srv
+            while IFS=$'\t' read -r d srv _ || [[ -n "$d" ]]; do
+                [[ -z "$d" || "$d" =~ ^# ]] && continue
+                if [[ "$srv" == "hermes" || "$srv" == "both" ]]; then
+                    dashboard_domain="$d"
+                    break
+                fi
+            done < "$STACK_DIR/domains.tsv"
+        fi
+    fi
+    
     python3 -c "
-import sys, os, re
+import sys, os, re, json
 
 config_file = sys.argv[1]
 model_name = sys.argv[2]
@@ -577,30 +589,42 @@ if os.path.isfile(config_file):
     with open(config_file, 'r', encoding='utf-8') as f:
         content = f.read()
 
-# Replace or append top-level blocks safely
+# 1. Auto-heal previously corrupted lines where a top-level key was concatenated
+# onto an indented line (e.g. '  api_key: 123456_config_version: 51')
+content = re.sub(
+    r'(?m)^([ \t]+[A-Za-z0-9_.-]+:[ \t]*[^\n]*?)(_config_version:[ \t]*[0-9]+)',
+    r'\1\n\2',
+    content
+)
+
+# 2. Replace or append top-level YAML blocks without consuming the newline before the next key
 def replace_or_append_block(text, block_name, new_block_content):
-    pattern = re.compile(r'(?m)^' + re.escape(block_name) + r':(?:\n(?:\s+.*|\s*))*')
+    # Match block_name: plus only indented lines (or blank lines followed by indented lines)
+    pattern = re.compile(
+        r'(?m)^' + re.escape(block_name) + r':[ \t]*(?:#.*)?(?:\n(?:[ \t]+.*|[ \t]*(?=\n[ \t]+\S)))*'
+    )
+    replacement = new_block_content.strip()
     if pattern.search(text):
-        return pattern.sub(new_block_content.strip(), text, count=1)
+        return pattern.sub(lambda _: replacement, text, count=1)
     else:
         trimmed = text.rstrip()
         prefix = (trimmed + '\n\n') if trimmed else ''
-        return prefix + new_block_content.strip() + '\n'
-
-new_model_block = f'''model:
-  default: {model_name}
-  provider: custom
-  base_url: http://nine-router:20128/v1
-  api_key: {api_key}'''
+        return prefix + replacement + '\n'
 
 public_url = f'https://{domain}' if domain != 'localhost' else 'http://localhost:9119'
 
+new_model_block = f'''model:
+  default: {json.dumps(model_name)}
+  provider: \"custom\"
+  base_url: \"http://nine-router:20128/v1\"
+  api_key: {json.dumps(api_key)}'''
+
 new_dashboard_block = f'''dashboard:
-  public_url: {public_url}
+  public_url: {json.dumps(public_url)}
   trusted_proxies:
-    - 127.0.0.1/32
-    - 172.16.0.0/12
-    - 10.0.0.0/8'''
+    - \"127.0.0.1/32\"
+    - \"172.16.0.0/12\"
+    - \"10.0.0.0/8\"'''
 
 content = replace_or_append_block(content, 'model', new_model_block)
 content = replace_or_append_block(content, 'dashboard', new_dashboard_block)
@@ -617,6 +641,169 @@ with open(config_file, 'w', encoding='utf-8') as f:
     if [[ "$(id -u)" -eq 0 ]]; then
         chown 10000:10000 "$config_file" 2>/dev/null || true
     fi
+}
+
+# Run a command inside the Hermes Agent container (attaches TTY when interactive)
+hermes_exec() {
+    init_paths
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^ai-stack-hermes$"; then
+        warn "Hermes Agent container is not running. Starting stack..."
+        stack_start
+    fi
+    local tty_flags="-i"
+    if [[ -t 0 ]] && [[ -t 1 ]]; then
+        tty_flags="-it"
+    fi
+    if has_tty && [[ -t 1 ]]; then
+        docker exec -it ai-stack-hermes "$@" </dev/tty
+    else
+        docker exec "$tty_flags" ai-stack-hermes "$@"
+    fi
+}
+
+# Auto-repair Hermes config.yaml and verify inside container if running
+hermes_fix_config() {
+    init_paths
+    ensure_stack_secrets
+    local model
+    model=$(env_get "DEFAULT_MODEL" "nousresearch/hermes-3-llama-3.1-8b")
+    local key
+    key=$(env_get "INITIAL_PASSWORD" "123456")
+    merge_hermes_config "$model" "$key" ""
+    success "Repaired and synchronized $STACK_DIR/hermes/config.yaml"
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^ai-stack-hermes$"; then
+        docker exec ai-stack-hermes hermes config check || true
+    fi
+}
+
+# Show how to access Hermes Agent (CLI, TUI, Web UI, API, and SSH tunnel)
+hermes_access_info() {
+    init_paths
+    ensure_stack_secrets
+    local dash_en
+    dash_en=$(env_get "HERMES_DASHBOARD_ENABLED" "true")
+    local api_en
+    api_en=$(env_get "HERMES_API_ENABLED" "true")
+    local huser
+    huser=$(env_get "HERMES_DASHBOARD_BASIC_AUTH_USERNAME" "admin")
+    local hpass
+    hpass=$(env_get "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD" "admin123")
+    local rpass
+    rpass=$(env_get "INITIAL_PASSWORD" "123456")
+    local akey
+    akey=$(env_get "API_SERVER_KEY" "")
+    local srv_ip
+    srv_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [[ -z "$srv_ip" ]] && srv_ip="YOUR_VPS_IP"
+
+    printf "\n  %b╭──────────────────────────────────────────────────────────────────────╮%b\n" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b  %b🤖 HERMES AGENT & 9ROUTER ACCESS GUIDE%b                              %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD$C_WHITE" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b╰──────────────────────────────────────────────────────────────────────╯%b\n" "$C_CYAN" "$C_RESET"
+    printf "\n  %b1. Direct Terminal Access (Works anytime, even with Web UI disabled):%b\n" "$C_BOLD" "$C_RESET"
+    printf "     • Interactive Chat:       %baistack hermes chat%b\n" "$C_CYAN" "$C_RESET"
+    printf "     • Fullscreen Agent TUI:   %baistack hermes tui%b\n" "$C_CYAN" "$C_RESET"
+    printf "     • Agent Setup Wizard:     %baistack hermes setup%b  (Telegram/Discord/Slack/Tools)\n" "$C_CYAN" "$C_RESET"
+    printf "     • Edit config.yaml:       %baistack hermes config edit%b\n" "$C_CYAN" "$C_RESET"
+    printf "     • Repair config.yaml:     %baistack hermes fix-config%b\n" "$C_CYAN" "$C_RESET"
+
+    printf "\n  %b2. Web UI & API Credentials:%b\n" "$C_BOLD" "$C_RESET"
+    printf "     • 9Router Admin UI:       http://127.0.0.1:20128/admin  (Password: %b%s%b)\n" "$C_GREEN" "$rpass" "$C_RESET"
+    if [[ "$dash_en" == "true" ]]; then
+        printf "     • Hermes Web UI:          http://127.0.0.1:9119         (User: %b%s%b / Pass: %b%s%b)\n" "$C_GREEN" "$huser" "$C_RESET" "$C_GREEN" "$hpass" "$C_RESET"
+    else
+        printf "     • Hermes Web UI:          %bDisabled%b (Enable via: %baistack features dashboard on && aistack restart%b)\n" "$C_YELLOW" "$C_RESET" "$C_CYAN" "$C_RESET"
+    fi
+    if [[ "$api_en" == "true" ]]; then
+        printf "     • Hermes OpenAI API:      http://127.0.0.1:8642/v1      (Bearer Key: %b%s%b)\n" "$C_GREEN" "$akey" "$C_RESET"
+    fi
+
+    printf "\n  %b3. Remote Access from Your Laptop (SSH Port-Forwarding):%b\n" "$C_BOLD" "$C_RESET"
+    printf "     Run this on your laptop terminal to open both dashboards locally:\n"
+    printf "     %bssh -L 9119:127.0.0.1:9119 -L 20128:127.0.0.1:20128 root@%s%b\n" "$C_CYAN" "$srv_ip" "$C_RESET"
+    printf "     Then open %bhttp://localhost:9119%b (Hermes) and %bhttp://localhost:20128/admin%b (9Router).\n" "$C_GREEN" "$C_RESET" "$C_GREEN" "$C_RESET"
+    printf "     (Or expose them over HTTPS via: %baistack domain add%b)\n\n" "$C_CYAN" "$C_RESET"
+}
+
+# Edit Hermes config.yaml safely on host and validate
+hermes_edit_config() {
+    init_paths
+    hermes_fix_config >/dev/null 2>&1 || true
+    local cfg="$STACK_DIR/hermes/config.yaml"
+    local editor="${EDITOR:-nano}"
+    if ! command -v "$editor" >/dev/null 2>&1; then
+        command -v vi >/dev/null 2>&1 && editor="vi"
+    fi
+    if has_tty; then
+        "$editor" "$cfg" </dev/tty >/dev/tty
+    else
+        "$editor" "$cfg"
+    fi
+    hermes_fix_config
+}
+
+# CLI dispatcher for 'aistack hermes ...'
+hermes_cli() {
+    init_paths
+    # Always heal config.yaml before running any hermes command
+    merge_hermes_config >/dev/null 2>&1 || true
+    local sub="${1:-status}"
+    shift || true
+    case "$sub" in
+        chat)
+            hermes_exec hermes chat "$@"
+            ;;
+        tui)
+            hermes_exec hermes --tui "$@"
+            ;;
+        setup)
+            hermes_exec hermes setup "$@"
+            ;;
+        model)
+            if [[ $# -gt 0 ]]; then
+                env_set "DEFAULT_MODEL" "$1"
+                merge_hermes_config "$1" "$(env_get "INITIAL_PASSWORD" "123456")" ""
+                success "Default Hermes model updated to: $1"
+            else
+                hermes_exec hermes model
+            fi
+            ;;
+        config)
+            local csub="${1:-show}"
+            shift || true
+            case "$csub" in
+                edit)  hermes_edit_config ;;
+                fix)   hermes_fix_config ;;
+                check) hermes_exec hermes config check ;;
+                set)   hermes_exec hermes config set "$@"; merge_hermes_config >/dev/null 2>&1 || true ;;
+                show|*) hermes_exec hermes config "$csub" "$@" ;;
+            esac
+            ;;
+        fix-config|repair)
+            hermes_fix_config
+            ;;
+        access|info)
+            hermes_access_info
+            ;;
+        status)
+            hermes_access_info
+            if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^ai-stack-hermes$"; then
+                hermes_exec hermes status
+            fi
+            ;;
+        doctor)
+            hermes_exec hermes doctor "$@"
+            ;;
+        shell|sh|bash)
+            hermes_exec bash "$@"
+            ;;
+        exec)
+            hermes_exec "$@"
+            ;;
+        *)
+            # Forward any other native hermes CLI subcommands (e.g. skills, plugins, cron, sessions)
+            hermes_exec hermes "$sub" "$@"
+            ;;
+    esac
 }
 
 # ------------------------------------------------------------------------------
@@ -1290,7 +1477,7 @@ arvan_cidrs = [
 cf_nets = [ipaddress.ip_network(c) for c in cf_cidrs]
 arvan_nets = [ipaddress.ip_network(c) for c in arvan_cidrs]
 
-provider = 'Direct / Unknown'
+provider = 'Direct DNS'
 try:
     infos = socket.getaddrinfo(domain, 80)
     for info in infos:
@@ -1304,10 +1491,31 @@ try:
                 provider = 'ArvanCloud'
                 break
 except Exception:
-    provider = 'Unresolvable'
+    provider = 'Unresolved'
 
 print(provider)
 " "$domain"
+}
+
+# Print a clear visual guide explaining Domain Services and SSL/TLS Modes
+domain_explain_guide() {
+    printf "\n  %b╭──────────────────────────────────────────────────────────────────────╮%b\n" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b  %b🌐 DOMAIN ROUTING & SSL/TLS QUICK GUIDE%b                             %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD$C_WHITE" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b├──────────────────────────────────────────────────────────────────────┤%b\n" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b  %b1. Which Service Should I Expose?%b                                   %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b     • %bBoth (Recommended)%b: Exposes Hermes Web UI at %bhttps://domain/%b   %b│%b\n" "$C_CYAN" "$C_RESET" "$C_GREEN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b       and 9Router OpenAI API at %bhttps://domain/v1/*%b on one domain.   %b│%b\n" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b     • %b9Router Only%b:       Exposes 9Router Admin UI & OpenAI API.     %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b     • %bHermes Only%b:        Exposes Hermes Agent Web UI only.          %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b├──────────────────────────────────────────────────────────────────────┤%b\n" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b  %b2. Which SSL / TLS Mode Should I Pick?%b                              %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b     • %bAuto TLS (Let's Encrypt / ZeroSSL)%b:                            %b│%b\n" "$C_CYAN" "$C_RESET" "$C_GREEN" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b       Best when DNS A-record points directly to this VPS IP (or      %b│%b\n" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b       Cloudflare/Arvan proxy cloud icon is Grey / DNS-Only).         %b│%b\n" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b     • %bOrigin Certificate (Cloudflare / ArvanCloud CDN)%b:              %b│%b\n" "$C_CYAN" "$C_RESET" "$C_GREEN" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b       Best when CDN Orange Cloud is ON with 'Full (Strict)' SSL.     %b│%b\n" "$C_CYAN" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b│%b     • %bInternal Self-Signed%b: For LAN, Tailscale, or private testing.  %b│%b\n" "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf "  %b╰──────────────────────────────────────────────────────────────────────╯%b\n" "$C_CYAN" "$C_RESET"
 }
 
 # Generate Caddyfile from domains.tsv
@@ -1424,26 +1632,32 @@ domain_list() {
     init_paths
     local domains_tsv="$STACK_DIR/domains.tsv"
     
-    printf "\n%bConfigured Domains:%b\n" "$C_BOLD" "$C_RESET"
-    printf "%-30s %-12s %-10s %-15s\n" "DOMAIN" "SERVICE" "TLS" "CDN PROVIDER"
-    printf "%-30s %-12s %-10s %-15s\n" "------------------------------" "------------" "----------" "---------------"
+    printf "\n%bConfigured Domains & Routes:%b\n" "$C_BOLD" "$C_RESET"
+    printf "  %-26s %-24s %-12s %-14s\n" "DOMAIN" "ROUTED TARGET" "TLS MODE" "DNS / CDN"
+    printf "  %-26s %-24s %-12s %-14s\n" "--------------------------" "------------------------" "------------" "--------------"
     
     local count=0
     while IFS=$'\t' read -r dom srv tls cert key || [[ -n "$dom" ]]; do
         [[ -z "$dom" || "$dom" =~ ^# ]] && continue
         local cdn
         cdn=$(check_cdn_provider "$dom")
-        printf "%-30s %-12s %-10s %-15s\n" "$dom" "$srv" "$tls" "$cdn"
+        local route_desc="$srv"
+        case "$srv" in
+            9router) route_desc="9Router (:20128)" ;;
+            hermes)  route_desc="Hermes Web UI (:9119)" ;;
+            both)    route_desc="Hermes (/) + 9Router (/v1)" ;;
+        esac
+        printf "  %-26s %-24s %-12s %-14s\n" "$dom" "$route_desc" "$tls" "$cdn"
         ((count++)) || true
     done < "$domains_tsv"
     
     if [[ $count -eq 0 ]]; then
-        printf "%b(No domains configured yet)%b\n" "$C_DIM" "$C_RESET"
+        printf "  %b(No custom domains configured — services listen on 127.0.0.1 only)%b\n" "$C_DIM" "$C_RESET"
     fi
     printf "\n"
 }
 
-# Add a domain
+# Add or update a domain
 domain_add() {
     init_paths
     local domain="${1:-}"
@@ -1451,48 +1665,74 @@ domain_add() {
     local tls_mode="${3:-}"
     
     if [[ -z "$domain" ]]; then
-        tui_input "Domain name (e.g. ai.example.com)" "" domain
+        domain_explain_guide
+        printf "\n"
+        tui_input "Enter domain or subdomain (e.g. ai.example.com, leave empty to cancel)" "" domain
     fi
-    domain=$(printf "%s" "$domain" | tr '[:upper:]' '[:lower:]' | tr -d ' /')
+    domain=$(printf "%s" "$domain" | sed -E 's#^https?://##; s#/.*$##' | tr '[:upper:]' '[:lower:]' | tr -d ' ')
     
     if [[ -z "$domain" ]]; then
-        warn "Domain name cannot be empty."
+        warn "Domain setup canceled."
         return 1
     fi
     
-    # Check if domain already exists
+    if [[ ! "$domain" =~ ^[a-z0-9.-]+\.[a-z]{2,}$ ]]; then
+        warn "Invalid domain format: '$domain' (expected e.g. ai.example.com)."
+        return 1
+    fi
+    
+    # If domain already exists, offer to update/replace it in interactive mode
     if grep -q "^${domain}[[:space:]]" "$STACK_DIR/domains.tsv" 2>/dev/null; then
-        warn "Domain $domain is already configured."
-        return 1
+        if is_interactive_tty && [[ -z "${2:-}" ]]; then
+            if tui_confirm "Domain '$domain' is already configured. Update its routing/SSL settings?" "y"; then
+                sed -i "/^${domain}[[:space:]]/d" "$STACK_DIR/domains.tsv"
+            else
+                return 1
+            fi
+        else
+            warn "Domain $domain is already configured."
+            return 1
+        fi
     fi
     
-    # Inspect CDN
+    # Inspect DNS & CDN
     local cdn
     cdn=$(check_cdn_provider "$domain")
-    info "Detected DNS/CDN provider: $cdn"
+    if [[ "$cdn" == "Unresolved" ]]; then
+        warn "DNS check: '$domain' does not resolve to an IP yet (make sure an A record points to this server)."
+    else
+        info "DNS check: '$domain' resolves via $cdn"
+    fi
     
     if [[ -z "$service" ]]; then
-        tui_select "Select service to expose on $domain" \
-            "9Router      — OpenAI-compatible AI Gateway & Admin UI" \
-            "Hermes Agent — Autonomous Agent Web Portal & API" \
-            "Both         — Routes /v1 & /api to 9Router, root / to Hermes" || return 1
+        TUI_DEFAULT_INDEX=0 tui_select "Step 1/2 — What should https://$domain serve?" \
+            "Both (Unified) — Hermes Web UI at / and 9Router OpenAI API at /v1/* (Recommended)" \
+            "9Router Only   — 9Router Admin Dashboard (/admin) & OpenAI API (/v1/*)" \
+            "Hermes Only    — Hermes Agent Web Dashboard & Chat UI (:9119)" || return 1
         case "$TUI_CHOICE" in
-            1) service="hermes" ;;
-            2) service="both" ;;
-            *) service="9router" ;;
+            0) service="both" ;;
+            1) service="9router" ;;
+            2) service="hermes" ;;
         esac
+    fi
+    
+    if [[ "$service" == "hermes" || "$service" == "both" ]]; then
+        if [[ "$(env_get "HERMES_DASHBOARD_ENABLED" "true")" != "true" ]]; then
+            info "Enabling Hermes Web UI (Port 9119) so https://$domain can reach it..."
+            env_set "HERMES_DASHBOARD_ENABLED" "true"
+        fi
     fi
     
     if [[ -z "$tls_mode" ]]; then
         local pre_tls=0
         if [[ "$cdn" == "Cloudflare" ]] || [[ "$cdn" == "ArvanCloud" ]]; then
-            info "CDN ($cdn) detected: Origin Certificate is recommended for Full (Strict) SSL."
+            info "CDN ($cdn) proxy detected: choose 'Origin Certificate' for Full (Strict) SSL, or 'Auto TLS' if DNS-only."
             pre_tls=1
         fi
-        TUI_DEFAULT_INDEX="$pre_tls" tui_select "Select SSL/TLS Mode for $domain" \
-            "Auto TLS           — Let's Encrypt / ZeroSSL DV ACME" \
-            "Origin Certificate — Paste Cloudflare / ArvanCloud Origin PEM" \
-            "Internal TLS       — Self-signed (Local / Tailscale)" || return 1
+        TUI_DEFAULT_INDEX="$pre_tls" tui_select "Step 2/2 — Select SSL/TLS Certificate Mode for $domain" \
+            "Auto TLS (Let's Encrypt / ZeroSSL) — Automatic free SSL (Requires ports 80/443 open)" \
+            "Origin Certificate (Cloudflare/Arvan) — Paste PEM cert & private key from CDN panel" \
+            "Internal Self-Signed TLS            — For local networks, Tailscale, or testing" || return 1
         case "$TUI_CHOICE" in
             1) tls_mode="origin" ;;
             2) tls_mode="internal" ;;
@@ -1509,20 +1749,28 @@ domain_add() {
         cert_file="$cert_dir/cert.pem"
         key_file="$cert_dir/key.pem"
         
-        printf "\n  %b▸ Paste Origin Certificate for %s (end with empty line):%b\n" "$C_BOLD" "$domain" "$C_RESET"
+        printf "\n  %b▸ Paste Origin Certificate PEM for %s (press Enter on an empty line when done):%b\n" "$C_BOLD$C_CYAN" "$domain" "$C_RESET"
         local cert_content=""
         while IFS= tty_read -r line; do
             [[ -z "$line" && "$cert_content" =~ -----END[[:space:]]CERTIFICATE----- ]] && break
             cert_content+="$line"$'\n'
         done
+        if [[ ! "$cert_content" =~ -----BEGIN[[:space:]]CERTIFICATE----- ]]; then
+            warn "Invalid certificate PEM. Aborting domain setup."
+            return 1
+        fi
         printf "%s" "$cert_content" > "$cert_file"
         
-        printf "\n  %b▸ Paste Origin Private Key for %s (end with empty line):%b\n" "$C_BOLD" "$domain" "$C_RESET"
+        printf "\n  %b▸ Paste Origin Private Key PEM for %s (press Enter on an empty line when done):%b\n" "$C_BOLD$C_CYAN" "$domain" "$C_RESET"
         local key_content=""
         while IFS= tty_read -r line; do
-            [[ -z "$line" && "$key_content" =~ -----END[[:space:]]PRIVATE[[:space:]]KEY----- ]] && break
+            [[ -z "$line" && "$key_content" =~ -----END[[:space:]].*PRIVATE[[:space:]]KEY----- ]] && break
             key_content+="$line"$'\n'
         done
+        if [[ ! "$key_content" =~ PRIVATE[[:space:]]KEY----- ]]; then
+            warn "Invalid private key PEM. Aborting domain setup."
+            return 1
+        fi
         printf "%s" "$key_content" > "$key_file"
         chmod 600 "$key_file"
     fi
@@ -1548,7 +1796,7 @@ domain_add() {
     else
         caddy_reload
     fi
-    success "Domain $domain configured ($service, TLS: $tls_mode)."
+    success "Domain https://$domain configured (Target: $service, TLS: $tls_mode)."
 }
 
 # Remove a domain
@@ -1942,6 +2190,9 @@ save_current_digests() {
 stack_start() {
     init_paths
     stack_preflight
+    
+    # Ensure Hermes config.yaml is valid and synchronized before starting
+    merge_hermes_config >/dev/null 2>&1 || true
     
     if [[ "$(env_get "PROXY_MODE" "")" == "xray" ]]; then
         xray_generate_config
@@ -2562,18 +2813,111 @@ stack_setup() {
     printf "  %b╰──────────────────────────────────────────────────────────────────────╯%b\n" "$C_GREEN" "$C_RESET"
 }
 
-# Install 'aistack' CLI shortcut symlink
+# Install 'aistack' and 'hermesstack' CLI shortcut symlinks
 install_shortcut() {
-    local target="/usr/local/bin/aistack"
+    local bin_dir="/usr/local/bin"
     if [[ "$(id -u)" -ne 0 ]]; then
-        target="${HOME}/.local/bin/aistack"
-        mkdir -p "${HOME}/.local/bin"
+        bin_dir="${HOME}/.local/bin"
+        mkdir -p "$bin_dir"
     fi
     
-    ln -sf "$SCRIPT_PATH" "$target" 2>/dev/null || true
-    if [[ -L "$target" ]]; then
-        success "Installed CLI shortcut: $target"
+    ln -sf "$SCRIPT_PATH" "$bin_dir/aistack" 2>/dev/null || true
+    ln -sf "$SCRIPT_PATH" "$bin_dir/hermesstack" 2>/dev/null || true
+    if [[ -L "$bin_dir/aistack" ]]; then
+        success "Installed CLI shortcuts: $bin_dir/aistack & $bin_dir/hermesstack"
     fi
+}
+
+# Uninstall HermesStack (Standard or Complete Purge)
+stack_uninstall() {
+    local purge="false"
+    for arg in "$@"; do
+        case "$arg" in
+            --purge|-p|purge) purge="true" ;;
+            -y|--yes) ASSUME_YES="true" ;;
+        esac
+    done
+
+    printf "\n  %b╭──────────────────────────────────────────────────────────────────────╮%b\n" "$C_YELLOW" "$C_RESET"
+    printf "  %b│%b  %b🗑️  HERMES STACK UNINSTALLER%b                                         %b│%b\n" "$C_YELLOW" "$C_RESET" "$C_BOLD$C_WHITE" "$C_RESET" "$C_YELLOW" "$C_RESET"
+    printf "  %b╰──────────────────────────────────────────────────────────────────────╯%b\n" "$C_YELLOW" "$C_RESET"
+
+    if [[ "${ASSUME_YES:-false}" != "true" ]]; then
+        tui_select "Select Uninstallation Mode" \
+            "Standard Uninstall — Stop & remove containers/CLI, but KEEP databases, SSL certs & configs" \
+            "Complete Purge     — Delete EVERYTHING (containers, volumes, databases, SSL certs & $STACK_DIR)" \
+            "Cancel             — Return without uninstalling" || return 0
+
+        case "$TUI_CHOICE" in
+            0) purge="false" ;;
+            1)
+                purge="true"
+                warn "Complete Purge will permanently delete all 9Router providers, Hermes memory, and SSL certificates!"
+                if ! tui_confirm "Are you 100% sure you want to permanently delete all data?" "n"; then
+                    info "Uninstallation canceled."
+                    return 0
+                fi
+                ;;
+            *)
+                info "Uninstallation canceled."
+                return 0
+                ;;
+        esac
+    fi
+
+    # Collect candidate stack and script directories
+    local script_dir
+    script_dir="$(dirname "$SCRIPT_PATH")"
+    local candidate_dirs=("$STACK_DIR" "/opt/ai-stack" "/opt/hermes-stack" "${HOME}/ai-stack" "${HOME}/.hermes-stack")
+    # Only include script_dir if it's an installed location (not a git repository checkout)
+    if [[ ! -d "$script_dir/.git" ]]; then
+        candidate_dirs+=("$script_dir")
+    fi
+
+    # 1. Stop and remove containers
+    local d
+    for d in "${candidate_dirs[@]}"; do
+        if [[ -f "$d/docker-compose.yml" ]] && command -v docker >/dev/null 2>&1; then
+            info "Stopping containers in $d..."
+            if [[ "$purge" == "true" ]]; then
+                docker compose -f "$d/docker-compose.yml" down -v --remove-orphans 2>/dev/null || true
+            else
+                docker compose -f "$d/docker-compose.yml" down --remove-orphans 2>/dev/null || true
+            fi
+        fi
+    done
+
+    if command -v docker >/dev/null 2>&1; then
+        docker rm -f ai-stack-nine-router ai-stack-hermes ai-stack-caddy ai-stack-xray 2>/dev/null || true
+        if [[ "$purge" == "true" ]]; then
+            info "Removing Docker persistent volumes..."
+            docker volume rm -f ai-stack_nine_router_data ai-stack_caddy_data ai-stack_caddy_config 2>/dev/null || true
+        fi
+    fi
+
+    # 2. Remove automated backup cron jobs
+    if command -v crontab >/dev/null 2>&1; then
+        (crontab -l 2>/dev/null | grep -v "backup create" | grep -v "aistack" | grep -v "hermes-stack" || true) | crontab - 2>/dev/null || true
+    fi
+
+    # 3. Remove CLI symlinks
+    info "Removing CLI shortcuts (aistack, hermesstack)..."
+    rm -f /usr/local/bin/aistack /usr/local/bin/hermesstack "${HOME}/.local/bin/aistack" "${HOME}/.local/bin/hermesstack" 2>/dev/null || true
+
+    # 4. Purge or preserve directories
+    if [[ "$purge" == "true" ]]; then
+        for d in "${candidate_dirs[@]}"; do
+            if [[ -d "$d" ]] && [[ ! -d "$d/.git" ]]; then
+                info "Removing directory: $d"
+                rm -rf "$d" 2>/dev/null || true
+            fi
+        done
+        success "HermesStack and all associated data have been completely purged."
+    else
+        info "Preserved stack data and configurations at: $STACK_DIR"
+        success "HermesStack containers stopped and CLI shortcuts removed."
+    fi
+    exit 0
 }
 
 # Internal Self-Test Suite
@@ -2606,13 +2950,23 @@ run_selftest() {
     echo "$ob" | grep -q '"serverName": "cdn.example.com"' || die "Self-test failed: Xray reality SNI"
     success "Self-test 2 (Xray link parser): PASSED"
     
-    # Test 3: Hermes config merger
+    # Test 3: Hermes config merger & self-healing of concatenated _config_version
+    cat > "$test_dir/hermes/config.yaml" << 'EOF'
+model:
+  default: old-model
+  provider: custom
+  base_url: http://nine-router:20128/v1
+  api_key: 112111_config_version: 51
+dashboard:
+  public_url: http://localhost:9119
+EOF
     merge_hermes_config "test-model-4b" "secret-key-123" "ai.test.domain"
     local cfg_content
     cfg_content=$(cat "$test_dir/hermes/config.yaml")
-    echo "$cfg_content" | grep -q "default: test-model-4b" || die "Self-test failed: Hermes model merge"
-    echo "$cfg_content" | grep -q "https://ai.test.domain" || die "Self-test failed: Hermes dashboard merge"
-    success "Self-test 3 (Hermes config.yaml merge): PASSED"
+    echo "$cfg_content" | grep -q 'default: "test-model-4b"' || die "Self-test failed: Hermes model merge"
+    echo "$cfg_content" | grep -q 'https://ai.test.domain' || die "Self-test failed: Hermes dashboard merge"
+    echo "$cfg_content" | grep -q '^_config_version: 51$' || die "Self-test failed: Hermes _config_version preservation/healing"
+    success "Self-test 3 (Hermes config.yaml merge & self-healing): PASSED"
     
     # Cleanup
     STACK_DIR="$prev_stack"
@@ -2624,16 +2978,18 @@ run_selftest() {
 tui_menu_domains() {
     while true; do
         domain_list
-        tui_select "Domain & SSL Management" \
-            "Add a Domain (Auto-TLS / Cloudflare & Arvan Origin / Internal)" \
-            "Remove an Existing Domain" \
-            "Sync & Reload Caddyfile" \
-            "Back to Main Menu" || break
+        tui_select "🌐 Domain & SSL Manager (1-4 quick-pick, q back)" \
+            "➕ Add or Update a Domain (Guided Service & SSL Setup)" \
+            "🗑️  Remove an Existing Domain" \
+            "📖 View Domain Routing & SSL Mode Guide (When to use Auto vs Origin)" \
+            "🔄 Regenerate & Reload Caddy Reverse Proxy Now" \
+            "🔙 Back to Main Menu" || break
         case "$TUI_CHOICE" in
             0) domain_add "" "" "" || true ;;
             1) domain_rm "" || true ;;
-            2) generate_caddyfile; caddy_reload || true ;;
-            3) break ;;
+            2) domain_explain_guide; tui_pause ;;
+            3) generate_caddyfile; caddy_reload || true; tui_pause ;;
+            4) break ;;
         esac
     done
 }
@@ -2642,14 +2998,14 @@ tui_menu_proxy() {
     while true; do
         printf "\n"
         proxy_status
-        tui_select "Outbound Proxy & Xray Anti-Censorship" \
-            "Import Xray Share Link (vless://, vmess://, trojan://, ss://)" \
-            "Set External SOCKS5 / HTTP Proxy URL" \
-            "Enable Proxy Routing & Apply to Stack" \
-            "Disable Proxy Routing (Direct Connection)" \
-            "Clear All Imported Xray Links" \
-            "Show Host Shell Proxy Environment Variables" \
-            "Back to Main Menu" || break
+        tui_select "🛡️ Outbound Proxy & Xray Anti-Censorship (Routes Containers + Host)" \
+            "➕ Import Xray Share Link (vless://, vmess://, trojan://, ss://)" \
+            "🔗 Set External SOCKS5 / HTTP Proxy URL (e.g. socks5://127.0.0.1:1080)" \
+            "🟢 Enable Outbound Proxy Routing & Apply to Stack" \
+            "⚪ Disable Outbound Proxy Routing (Direct Connection)" \
+            "🧹 Clear All Imported Xray Share Links" \
+            "💻 Show Host Shell Proxy Export Commands (HTTP_PROXY / ALL_PROXY)" \
+            "🔙 Back to Main Menu" || break
         case "$TUI_CHOICE" in
             0)
                 if proxy_add_link ""; then
@@ -2694,13 +3050,13 @@ tui_menu_features() {
         local m_cap
         m_cap=$(env_get "NINE_ROUTER_MAX_MEM" "256")
 
-        tui_select "Lightweight Mode & Optional Features (Press Enter to toggle)" \
-            "Hermes Web UI (Port 9119) : $([[ "$d_en" == "true" ]] && echo "ENABLED  → Press to Disable (Saves RAM)" || echo "DISABLED → Press to Enable")" \
-            "Hermes API (Port 8642)    : $([[ "$a_en" == "true" ]] && echo "ENABLED  → Press to Disable" || echo "DISABLED → Press to Enable")" \
-            "Caddy Reverse Proxy       : Mode [${c_en}] → Press to cycle (auto / on / off)" \
-            "9Router V8 Memory Cap     : ${m_cap} MB → Press to change (192 / 256 / 512 / Custom)" \
-            "Apply Changes & Restart Stack Now" \
-            "Back to Main Menu" || break
+        tui_select "🪶 Lightweight Mode & Resource Tuning (Press Enter to toggle)" \
+            "Hermes Web UI (:9119)   : $([[ "$d_en" == "true" ]] && echo "ON  → Press to Disable (Saves ~80MB RAM)" || echo "OFF → Press to Enable Web Dashboard")" \
+            "Hermes API (:8642)      : $([[ "$a_en" == "true" ]] && echo "ON  → Press to Disable HTTP API" || echo "OFF → Press to Enable OpenAI API Endpoint")" \
+            "Caddy Reverse Proxy     : [${c_en}] → Press to cycle (auto = only runs when domains exist)" \
+            "9Router V8 Heap Cap     : ${m_cap} MB → Press to change (192MB / 256MB / 512MB / Custom)" \
+            "✅ Apply Changes & Restart Stack Now" \
+            "🔙 Back to Main Menu" || break
 
         case "$TUI_CHOICE" in
             0)
@@ -2721,9 +3077,9 @@ tui_menu_features() {
                 ;;
             3)
                 tui_select "Select 9Router V8 Max Memory Limit" \
-                    "192 MB (Ultra-Light 1GB VPS)" \
-                    "256 MB (Recommended Default)" \
-                    "512 MB (High Concurrency)" \
+                    "192 MB — Ultra-Light (For 1GB–2GB RAM VPS)" \
+                    "256 MB — Balanced Default (Recommended)" \
+                    "512 MB — High Concurrency (For 4GB+ RAM VPS)" \
                     "Custom MB Value" || continue
                 case "$TUI_CHOICE" in
                     0) features_set memory 192 ;;
@@ -2749,6 +3105,28 @@ tui_menu_features() {
                 fi
                 break
                 ;;
+        esac
+    done
+}
+
+tui_menu_maintenance() {
+    while true; do
+        tui_select "🧰 Backups, Updates, Iran Toolkit & Maintenance" \
+            "💾 Backup & Restore Manager (SQLite + SSL + Configs)" \
+            "🇮🇷 Iran VPS Resilience Toolkit (Docker Mirrors / MTU / Offline Bundles)" \
+            "🔄 Update Stack Container Images (With Auto-Backup & Rollback)" \
+            "⏪ Rollback Stack Images to Previous Digests" \
+            "📜 Stream Live Container Logs (All or Per-Service)" \
+            "🚀 Re-run Initial Guided Setup Wizard" \
+            "🔙 Back to Main Menu" || break
+        case "$TUI_CHOICE" in
+            0) tui_menu_backups ;;
+            1) tui_menu_iran ;;
+            2) stack_update; tui_pause ;;
+            3) stack_rollback; tui_pause ;;
+            4) tui_menu_logs ;;
+            5) stack_setup; tui_pause ;;
+            6) break ;;
         esac
     done
 }
@@ -2852,40 +3230,86 @@ tui_menu_logs() {
     esac
 }
 
+tui_menu_hermes() {
+    while true; do
+        merge_hermes_config >/dev/null 2>&1 || true
+        local cur_m
+        cur_m=$(env_get "DEFAULT_MODEL" "nousresearch/hermes-3-llama-3.1-8b")
+        local dash_en
+        dash_en=$(env_get "HERMES_DASHBOARD_ENABLED" "true")
+
+        tui_select "🤖 Hermes Agent Console & Configuration (Model: $cur_m)" \
+            "💬 Launch Interactive Agent Chat in Terminal (hermes chat)" \
+            "🖥️  Launch Fullscreen Agent TUI (hermes --tui)" \
+            "⚙️  Run Hermes Interactive Setup Wizard (Telegram, Discord, Slack, Tools)" \
+            "🧠 Change Default AI Model (Currently: $cur_m)" \
+            "📝 Edit Hermes config.yaml Directly & Validate" \
+            "🔧 Repair / Validate Hermes config.yaml Now" \
+            "🌐 View Web UI, API & SSH Port-Forwarding Access Guide (WebUI: $([[ "$dash_en" == "true" ]] && echo "ON" || echo "OFF"))" \
+            "🐚 Open Interactive Shell Inside Hermes Container" \
+            "Back to Main Menu" || break
+
+        case "$TUI_CHOICE" in
+            0) hermes_exec hermes chat || true ;;
+            1) hermes_exec hermes --tui || true ;;
+            2) hermes_exec hermes setup || true; merge_hermes_config >/dev/null 2>&1 || true ;;
+            3)
+                local new_m=""
+                tui_input "Enter Default AI Model name (e.g. gpt-4o, claude-3-5-sonnet, nousresearch/hermes-3-llama-3.1-8b)" "$cur_m" new_m
+                if [[ -n "$new_m" ]]; then
+                    env_set "DEFAULT_MODEL" "$new_m"
+                    merge_hermes_config "$new_m" "$(env_get "INITIAL_PASSWORD" "123456")" ""
+                    success "Default model updated to: $new_m"
+                fi
+                ;;
+            4) hermes_edit_config || true; tui_pause ;;
+            5) hermes_fix_config || true; tui_pause ;;
+            6) hermes_access_info; tui_pause ;;
+            7) hermes_exec bash || true ;;
+            8) break ;;
+        esac
+    done
+}
+
 interactive_menu() {
     local last_choice=0
     while true; do
         tui_header
-        TUI_DEFAULT_INDEX="$last_choice" tui_select "Main Menu" \
-            "📊 Detailed Status, Endpoints & Credentials" \
-            "🪶 Lightweight Mode & Optional Features (Web UI / API / RAM)" \
-            "🛡️ Proxy & Xray Anti-Censorship (Share Links / Host Proxy)" \
-            "🌐 Domain & SSL Manager (Auto-TLS / Cloudflare / Arvan)" \
-            "⚡ Start / Restart Stack Services" \
-            "🛑 Stop Stack Services" \
-            "🩺 Run System & Outbound Network Doctor" \
-            "💾 Backup & Restore (SQLite + SSL + Configs)" \
-            "🇮🇷 Iran VPS Toolkit (Mirrors / MTU / Offline Bundles)" \
-            "🔄 Update Stack Images (With Auto-Rollback)" \
-            "📜 Stream Live Container Logs" \
-            "🚀 Re-run Initial Setup Wizard" \
+        TUI_DEFAULT_INDEX="$last_choice" tui_select "Main Menu (Keys 1-9 instant select)" \
+            "🤖 Hermes Agent Console   — Chat, TUI, Bot Setup, Model & Config Editor" \
+            "🌐 Domain & SSL Manager   — Expose Services via Auto-TLS or Cloudflare/Arvan CDN" \
+            "🛡️ Proxy & Xray Routing   — VLESS/VMess/Trojan/SS Balancer & Host Proxy" \
+            "🪶 Lightweight & Features — Toggle Hermes Web UI, API, Caddy & Memory Cap" \
+            "📊 Status & Access Guide  — Container Health, Ports, Passwords & SSH Tunnel" \
+            "⚡ Lifecycle & Doctor     — Start, Stop, Restart Services & Run Network Doctor" \
+            "🧰 Maintenance & Backups  — Backups, Iran Mirrors/MTU, Image Updates & Logs" \
+            "🗑️  Uninstall HermesStack  — Stop Stack & Remove CLI (Keep or Purge Data)" \
             "🚪 Exit" || break
 
         last_choice=$TUI_CHOICE
         case "$TUI_CHOICE" in
-            0) stack_status; tui_pause ;;
-            1) tui_menu_features ;;
+            0) tui_menu_hermes ;;
+            1) tui_menu_domains ;;
             2) tui_menu_proxy ;;
-            3) tui_menu_domains ;;
-            4) stack_restart; tui_pause ;;
-            5) stack_stop; tui_pause ;;
-            6) stack_doctor; tui_pause ;;
-            7) tui_menu_backups ;;
-            8) tui_menu_iran ;;
-            9) stack_update; tui_pause ;;
-            10) tui_menu_logs ;;
-            11) stack_setup; tui_pause ;;
-            12) break ;;
+            3) tui_menu_features ;;
+            4) stack_status; hermes_access_info; tui_pause ;;
+            5)
+                tui_select "⚡ Service Lifecycle & Diagnostics" \
+                    "🔄 Start / Restart All Stack Services" \
+                    "🛑 Stop All Stack Services" \
+                    "🩺 Run System & Outbound Network Doctor" \
+                    "📜 Stream Live Container Logs" \
+                    "🔙 Back to Main Menu" || continue
+                case "$TUI_CHOICE" in
+                    0) stack_restart; tui_pause ;;
+                    1) stack_stop; tui_pause ;;
+                    2) stack_doctor; tui_pause ;;
+                    3) tui_menu_logs ;;
+                esac
+                ;;
+            6) tui_menu_maintenance ;;
+            7) stack_uninstall ;;
+            8) break ;;
         esac
     done
     printf "\n"
@@ -2919,6 +3343,17 @@ Subcommands:
   doctor                Run diagnostics for host, RAM, DNS poisoning, and AI APIs
   update                Pull latest images with auto-backup and health verification
   rollback              Rollback to previous image digests if update failed
+
+Hermes Agent Commands:
+  hermes chat           Launch interactive Hermes Agent chat in terminal
+  hermes tui            Launch fullscreen Hermes Agent TUI
+  hermes setup          Run Hermes setup wizard (Telegram, Discord, Slack, tools, providers)
+  hermes model [name]   View or set the default AI model
+  hermes config edit    Edit Hermes config.yaml in $EDITOR and validate
+  hermes fix-config     Repair and validate Hermes config.yaml
+  hermes access         Show Web UI, API, and SSH port-forwarding instructions
+  hermes shell          Open a bash shell inside the Hermes container
+  hermes <args...>      Pass any command directly to 'hermes' CLI inside container
 
 Domain Commands:
   domain list           List configured domains and their CDN status
@@ -2956,7 +3391,8 @@ Iran Utilities:
   bundle import <file>  Import container images from offline tarball
 
 Other:
-  shortcut              Install 'aistack' command shortcut
+  uninstall [--purge]   Uninstall HermesStack (optionally purge all data & volumes)
+  shortcut              Install 'aistack' & 'hermesstack' CLI shortcuts
   selftest              Run internal unit tests
 EOF
 }
@@ -3078,6 +3514,12 @@ case "$CMD" in
             *) die "Unknown features subcommand: $sub" ;;
         esac
         ;;
+    hermes|agent)
+        hermes_cli "$@"
+        ;;
+    chat)
+        hermes_cli chat "$@"
+        ;;
     backup)
         sub="${1:-create}"
         shift || true
@@ -3115,6 +3557,9 @@ case "$CMD" in
         ;;
     shortcut)
         install_shortcut
+        ;;
+    uninstall|remove)
+        stack_uninstall "$@"
         ;;
     cron)
         install_backup_cron

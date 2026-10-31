@@ -58,8 +58,8 @@ assert 'geoip:private' not in cfg['routing']['rules'][1]['ip']
 "
 echo "  Xray configuration, DNS poisoning protection, and observatory verified."
 
-# 4. Test Hermes config.yaml preservation
-echo "[4/6] Testing Hermes config.yaml merge logic..."
+# 4. Test Hermes config.yaml preservation & self-healing
+echo "[4/7] Testing Hermes config.yaml merge & self-healing logic..."
 mkdir -p "$TEST_TEMP/hermes"
 cat > "$TEST_TEMP/hermes/config.yaml" << 'EOF'
 system:
@@ -67,20 +67,28 @@ system:
   temperature: 0.7
 model:
   default: old-model
-  api_key: old-key
+  provider: custom
+  base_url: http://nine-router:20128/v1
+  api_key: 112111_config_version: 51
 dashboard:
   public_url: http://old
 EOF
 
-# Merge new model and dashboard
+"$STACK_SCRIPT" --dir "$TEST_TEMP" hermes fix-config >/dev/null
+"$STACK_SCRIPT" --dir "$TEST_TEMP" hermes model "claude-3-5-sonnet" >/dev/null
+
 python3 -c "
-import sys
-# Simulating merge call logic
 cfg_file = '$TEST_TEMP/hermes/config.yaml'
 with open(cfg_file, 'r') as f:
     c = f.read()
-assert 'custom_setting: true' in c
+assert 'custom_setting: true' in c, 'Custom setting was lost'
+assert 'default: \"claude-3-5-sonnet\"' in c, 'Updated model not found'
+assert '\n_config_version: 51\n' in c, '_config_version: 51 was not healed onto its own line'
+assert 'api_key: 112111_config_version' not in c, 'Corrupted line still present'
+for line in c.splitlines():
+    assert line.count(': ') <= 1 or line.strip().startswith('#') or '\"http' in line, f'Invalid YAML mapping on line: {line}'
 "
+echo "  Hermes config.yaml merge & self-healing verified."
 
 STACK_DIR="$TEST_TEMP" "$STACK_SCRIPT" --dir "$TEST_TEMP" status >/dev/null 2>&1 || true
 

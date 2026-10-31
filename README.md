@@ -113,6 +113,18 @@ HermesStack can be managed interactively by running `aistack`, or non-interactiv
 | `aistack domain rm <domain>` | Remove domain and reload Caddy with zero downtime |
 | `aistack domain sync` | Regenerate `Caddyfile` and reload Caddy |
 
+### Hermes Agent Console & Configuration
+| Command | Description |
+| :--- | :--- |
+| `aistack hermes chat` | Launch interactive Hermes Agent chat directly in your terminal |
+| `aistack hermes tui` | Launch the fullscreen Hermes Agent TUI |
+| `aistack hermes setup` | Run Hermes interactive setup wizard (Telegram, Discord, Slack, tools, skills) |
+| `aistack hermes model [name]` | View or update the default AI model |
+| `aistack hermes config edit` | Edit `hermes/config.yaml` in `$EDITOR` and validate syntax |
+| `aistack hermes fix-config` | Auto-repair and validate `hermes/config.yaml` |
+| `aistack hermes access` | Show Web UI, OpenAI API, and SSH port-forwarding instructions |
+| `aistack hermes <args...>` | Run any native `hermes` CLI command inside the agent container |
+
 ### Proxy & Censorship Circumvention
 | Command | Description |
 | :--- | :--- |
