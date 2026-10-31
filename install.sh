@@ -76,6 +76,9 @@ fi
 if [[ -t 0 ]]; then
     info "Launching setup wizard..."
     exec "$BIN_DIR/aistack" setup
+elif [[ -t 1 ]] && [[ -e /dev/tty ]]; then
+    info "Launching setup wizard..."
+    exec "$BIN_DIR/aistack" setup </dev/tty
 else
     info "Non-interactive shell detected. Run 'aistack setup' to initialize."
 fi

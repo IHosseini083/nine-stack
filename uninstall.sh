@@ -58,10 +58,20 @@ if [[ "$ASSUME_YES" != "true" ]]; then
     if [[ "$PURGE" == "true" ]]; then
         printf "%bWARNING: --purge flag specified. All databases, certificates, and configs will be deleted!%b\n" "$C_RED" "$C_RESET"
     fi
-    read -r -p "Do you want to proceed with uninstallation? [y/N]: " confirm
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-        info "Uninstallation canceled."
-        exit 0
+    if [[ -e /dev/tty ]]; then
+        read -r -p "Do you want to proceed with uninstallation? [y/N]: " confirm </dev/tty || confirm="n"
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            info "Uninstallation canceled."
+            exit 0
+        fi
+        if [[ "$PURGE" != "true" ]]; then
+            read -r -p "Also purge all persistent data, configs, and SSL certificates? [y/N]: " purge_confirm </dev/tty || purge_confirm="n"
+            if [[ "$purge_confirm" == "y" || "$purge_confirm" == "Y" ]]; then
+                PURGE=true
+            fi
+        fi
+    else
+        die "Non-interactive shell without TTY. Pass '-y' (e.g. 'curl ... | bash -s -- -y') to confirm."
     fi
 fi
 
