@@ -10,6 +10,25 @@ A production-ready, self-hosted AI deployment stack combining **9Router** (LLM r
 
 ---
 
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Quickstart](#quickstart)
+- [Command Reference](#command-reference)
+  - [Lifecycle & Status](#lifecycle--status)
+  - [Domain Management](#domain-management)
+  - [Proxy & Censorship Circumvention](#proxy--censorship-circumvention)
+  - [Backups & Rollback](#backups--rollback)
+  - [Iran VPS Utilities](#iran-vps-utilities)
+- [Multiple Domains & CDN Integration](#multiple-domains--cdn-integration)
+- [Safe Configuration & Extensibility](#safe-configuration--extensibility)
+- [Documentation](#documentation)
+- [One-Liner Uninstallation](#one-liner-uninstallation)
+- [Testing](#testing)
+- [License](#license)
+
+---
+
 ## Architecture
 
 ```
@@ -131,6 +150,16 @@ HermesStack supports routing traffic through Cloudflare or ArvanCloud CDNs as we
   - `Caddyfile.d/custom`: Place custom Caddy route blocks here.
   - `docker-compose.override.yml`: Place additional Docker Compose services or volume mounts here.
 - **Safe Secrets**: All JWT, API, and salt keys are generated using `openssl rand -hex` and persisted with strict permissions (`chmod 600 .env`).
+
+---
+
+## Documentation
+
+Full guides and technical specifications are available in the [docs/](docs/README.md) directory:
+
+- [System Architecture](docs/ARCHITECTURE.md)
+- [Iran VPS & Network Resilience Guide](docs/IRAN_VPS_GUIDE.md)
+- [Proxy & Xray Balancer Configuration](docs/PROXY_AND_XRAY.md)
 
 ---
 
